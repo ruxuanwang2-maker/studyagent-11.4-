@@ -1,0 +1,29 @@
+# Dependencies and local package caches
+node_modules/
+.npm-cache/
+
+# Local application data and credentials
+data/
+uploads/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.enc
+.env
+.env.*
+!.env.example
+
+# Runtime and generated artifacts
+tmp/
+outputs/
+work/
+*.log
+
+# Local OCR model copies; OCR models are installed through npm dependencies
+*.traineddata
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

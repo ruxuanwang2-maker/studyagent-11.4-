@@ -1,0 +1,23 @@
+{
+  "name": "studyagent",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local-first AI learning workspace MVP",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "check:syntax": "node scripts/check-syntax.mjs",
+    "test": "node scripts/check-learning-core.mjs",
+    "check:http": "node scripts/check-learning-http.mjs",
+    "check:pdf": "node scripts/check-pdf-regression.mjs"
+  },
+  "dependencies": {
+    "@tesseract.js-data/chi_sim": "^1.0.0",
+    "@tesseract.js-data/eng": "^1.0.0",
+    "pdfjs-dist": "^4.10.38",
+    "tesseract.js": "^7.0.0"
+  }
+}
