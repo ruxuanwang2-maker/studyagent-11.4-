@@ -1,0 +1,58 @@
+name: StudyAgent checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Use Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Syntax check
+        run: npm run check:syntax
+
+      - name: Core learning tests
+        run: npm test
+
+      - name: Start local service
+        shell: bash
+        run: |
+          npm start > "$RUNNER_TEMP/studyagent.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/studyagent.pid"
+          for attempt in {1..40}; do
+            if curl --fail --silent http://127.0.0.1:4173/api/parser/status > /dev/null; then
+              exit 0
+            fi
+            sleep 0.25
+          done
+          cat "$RUNNER_TEMP/studyagent.log"
+          exit 1
+
+      - name: HTTP integration check
+        run: npm run check:http
+
+      - name: Stop local service
+        if: always()
+        shell: bash
+        run: |
+          if [ -f "$RUNNER_TEMP/studyagent.pid" ]; then
+            kill "$(cat "$RUNNER_TEMP/studyagent.pid")" || true
+          fi
