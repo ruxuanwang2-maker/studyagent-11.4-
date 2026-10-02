@@ -8,6 +8,8 @@ const RUNTIME_TMP = path.join(__dirname, '..', '..', 'tmp', 'runtime');
 fs.mkdirSync(RUNTIME_TMP, { recursive: true });
 
 const supported = new Set(['pdf', 'docx', 'doc', 'pptx', 'ppt', 'md', 'markdown', 'txt', 'xlsx', 'xls', 'csv', 'png', 'jpg', 'jpeg', 'webp']);
+const LEGACY_OFFICE_TARGETS = { doc: 'docx', ppt: 'pptx', xls: 'xlsx' };
+let officeConverterPromise;
 function extension(name) { return String(name || '').split('.').pop().toLowerCase(); }
 function xmlDecode(value) { return String(value || '').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'"); }
 function xmlText(fragment) { return xmlDecode(String(fragment || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim()); }
@@ -97,6 +99,41 @@ async function parseXlsx(name, buffer) {
   const archive = await unzip(buffer); try { const sharedXml = readFileIfExists(archive.tempDir, 'xl/sharedStrings.xml'); const shared = [...sharedXml.matchAll(/<si[\s\S]*?<\/si>/g)].map(match => xmlTexts(match[0])); const workbook = readFileIfExists(archive.tempDir, 'xl/workbook.xml'); const sheetNames = [...workbook.matchAll(/<sheet\b[^>]*name="([^"]+)"/gi)].map(match => xmlDecode(match[1])); const sheetDir = path.join(archive.tempDir, 'xl', 'worksheets'); const files = fs.existsSync(sheetDir) ? sortNumbered(fs.readdirSync(sheetDir).filter(file => /^sheet\d+\.xml$/i.test(file))) : []; const sections = files.map((file, index) => { const xml = fs.readFileSync(path.join(sheetDir, file), 'utf8'); const rows = [...xml.matchAll(/<row\b[^>]*>[\s\S]*?<\/row>/g)].map(row => [...row[0].matchAll(/<c\b([^>]*)>[\s\S]*?<\/c>/g)].map(cell => { const attrs = cell[1]; const body = cell[0]; const ref = attrs.match(/\br="([^"]+)"/)?.[1] || ''; const type = attrs.match(/\bt="([^"]+)"/)?.[1] || 'n'; const rawValue = body.match(/<v>([\s\S]*?)<\/v>/)?.[1] || ''; const value = type === 's' ? (shared[Number(rawValue)] || '') : type === 'inlineStr' ? xmlTexts(body.match(/<is>[\s\S]*?<\/is>/)?.[0] || '') : type === 'b' ? (rawValue === '1' ? 'TRUE' : 'FALSE') : xmlDecode(rawValue); const formula = body.match(/<f[^>]*>([\s\S]*?)<\/f>/)?.[1] || ''; return { ref, value, formula, type }; })).filter(row => row.length); const headers = rows[0]?.map(cell => cell.value) || []; const content = rows.map(row => row.map(cell => `${cell.ref ? `${cell.ref}=` : ''}${cell.value}${cell.formula ? ` [formula: ${cell.formula}]` : ''}`).join('\t')).join('\n'); const blocks = [{ type: 'table', headers, rows: rows.slice(1), source: 'xlsx', cellCount: rows.reduce((count, row) => count + row.length, 0) }]; return section(`${name}-sheet-${index + 1}`, sheetNames[index] || `Sheet ${index + 1}`, content, { sheet: index + 1, sheetName: sheetNames[index] || `Sheet ${index + 1}`, source: file, rows: rows.length, columns: Math.max(0, ...rows.map(row => row.length)), headers, cellTypes: [...new Set(rows.flat().map(cell => cell.type))] }, 'sheet', index, blocks); }); return { sections: sections.length ? sections : splitTextSections(name, ''), metadata: { format: 'xlsx', structured: true, sheetCount: files.length, sheetNames } }; } finally { archive.cleanup(); }
 }
 
+async function findOfficeConverter() {
+  if (!officeConverterPromise) officeConverterPromise = (async () => {
+    const candidates = [process.env.STUDYAGENT_OFFICE_CONVERTER, 'soffice', 'libreoffice'].filter(Boolean);
+    for (const candidate of candidates) {
+      if (path.isAbsolute(candidate) && !fs.existsSync(candidate)) continue;
+      try { await execFileAsync(candidate, ['--version'], { windowsHide: true, timeout: 2500, maxBuffer: 256 * 1024 }); return candidate; } catch { /* try the next converter */ }
+    }
+    return null;
+  })();
+  return officeConverterPromise;
+}
+
+async function legacyOfficeStatus() {
+  const converter = await findOfficeConverter();
+  return { available: Boolean(converter), command: converter, formats: Object.keys(LEGACY_OFFICE_TARGETS).map(value => value.toUpperCase()), mode: converter ? 'convert-to-ooxml' : 'printable-run-fallback' };
+}
+
+async function convertLegacyOffice(name, buffer, ext) {
+  const targetExtension = LEGACY_OFFICE_TARGETS[ext];
+  const converter = targetExtension ? await findOfficeConverter() : null;
+  if (!converter) return null;
+  const tempDir = fs.mkdtempSync(path.join(RUNTIME_TMP, 'studyagent-legacy-office-'));
+  const sourcePath = path.join(tempDir, `source.${ext}`);
+  try {
+    fs.writeFileSync(sourcePath, buffer);
+    await execFileAsync(converter, ['--headless', '--convert-to', targetExtension, '--outdir', tempDir, sourcePath], { windowsHide: true, timeout: 60000, maxBuffer: 2 * 1024 * 1024 });
+    const convertedPath = path.join(tempDir, `source.${targetExtension}`);
+    if (!fs.existsSync(convertedPath)) return null;
+    const parsed = await parseStructuredDocument({ name: `source.${targetExtension}`, buffer: fs.readFileSync(convertedPath) });
+    return { ...parsed, metadata: { ...parsed.metadata, format: fileType(ext), originalName: name, originalExtension: ext, convertedTo: targetExtension.toUpperCase(), conversion: 'office-converter' } };
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+}
+
 function printableRuns(value) { return [...String(value || '').matchAll(/[\u0020-\u007e\u4e00-\u9fff]{3,}/g)].map(match => match[0].replace(/\s+/g, ' ').trim()).filter(value => value.length >= 3 && !/^([A-F0-9]{8,}|Microsoft|Normal|Root Entry)$/i.test(value)); }
 function legacyOfficeText(buffer) { const candidates = [buffer.toString('utf8'), buffer.toString('latin1'), buffer.toString('utf16le')]; const values = []; const seen = new Set(); for (const candidate of candidates) for (const value of printableRuns(candidate)) { if (!seen.has(value)) { seen.add(value); values.push(value); } } return values.slice(0, 200).join('\n').trim(); }
 function legacyOfficeSections(name, buffer) { const text = legacyOfficeText(buffer); const paragraphs = text.split(/\r?\n+|(?<=[。！？.!?])\s+/).map(value => value.trim()).filter(Boolean).slice(0, 80); return (paragraphs.length ? paragraphs : ['此旧版 Office 文件已保存，但当前运行时未提供完整二进制 Office 解析器。']).map((value, index) => section(`${name}-legacy-${index + 1}`, `Legacy paragraph ${index + 1}`, value, { legacyBinary: true, paragraph: index + 1 }, 'legacy', index)); }
@@ -110,11 +147,16 @@ async function parseStructuredDocument({ name, buffer, parsePdf, ocrImage, visio
   else if (ext === 'xlsx') parsed = await parseXlsx(name, buffer);
   else if (ext === 'csv') { const rows = parseCsv(buffer.toString('utf8')); parsed = { sections: [section(`${name}-sheet-1`, 'CSV', rows.map(row => row.join('\t')).join('\n'), { sheet: 1, rows: rows.length, columns: rows[0]?.length || 0, headers: rows[0] || [] }, 'sheet', 0, [{ type: 'table', headers: rows[0] || [], rows: rows.slice(1).map(row => row.map(value => ({ value, type: value !== '' && !Number.isNaN(Number(value)) ? 'number' : 'string' }))), source: 'csv' }])], metadata: { format: 'csv', structured: true, rows: rows.length, columns: rows[0]?.length || 0 } }; }
   else if (['png', 'jpg', 'jpeg', 'webp'].includes(ext)) { const ocr = ocrImage ? await ocrImage(buffer, name) : { text: '', available: false }; const vision = visionImage ? await visionImage(buffer, name) : null; const visionText = String(vision?.text || vision?.answer || '').trim(); const blocks = [{ type: 'image', alt: name, source: type }, ...(ocr.text ? [{ type: 'paragraph', text: ocr.text, source: 'ocr' }] : []), ...(visionText ? [{ type: 'vision', text: visionText, source: 'vision', provider: vision.provider, model: vision.model }] : [])]; const content = [ocr.text, visionText].filter(Boolean).join('\n') || '未获得可提取的图片文字。'; parsed = { sections: [section(`${name}-image-1`, 'Image OCR', content, { image: 1, ocr: Boolean(ocr.text), vision: Boolean(visionText), visionProvider: vision?.provider || null, visionModel: vision?.model || null }, 'image', 0, blocks)], metadata: { format: type, structured: true, ocr: ocr.available, vision: Boolean(visionText), visionDescription: visionText ? 'persisted-vision-result' : 'requires-configured-vision-provider', visionError: vision?.error || null } }; }
-  else if (ext === 'doc' || ext === 'ppt' || ext === 'xls') { const sections = legacyOfficeSections(name, buffer); parsed = { sections, metadata: { format: type, structured: false, warning: 'legacy-binary-parser-limited', textExtraction: sections.some(item => !item.content.startsWith('此旧版 Office 文件已保存')) ? 'printable-run-fallback' : 'none' } }; }
+  else if (ext === 'doc' || ext === 'ppt' || ext === 'xls') {
+    let converted = null; let conversionError = null;
+    try { converted = await convertLegacyOffice(name, buffer, ext); } catch (error) { conversionError = error; }
+    if (converted) parsed = converted;
+    else { const sections = legacyOfficeSections(name, buffer); parsed = { sections, metadata: { format: type, structured: false, warning: 'legacy-binary-parser-limited', textExtraction: sections.some(item => !item.content.startsWith('此旧版 Office 文件已保存')) ? 'printable-run-fallback' : 'none', conversion: 'unavailable-or-failed', conversionError: conversionError?.message || null } }; }
+  }
   else parsed = { sections: splitTextSections(name, buffer.toString('utf8')), metadata: { format: type, structured: true } };
   const sections = parsed.sections.filter(item => item.content || item.kind === 'image').map((item, index) => ({ ...item, locator: { ...(item.locator || {}), page: Number(item.locator?.page || item.locator?.slide || item.locator?.sheet || index + 1) } })); const chunks = []; for (const item of sections) { const paragraphs = item.content.split(/\n{2,}|(?<=[。！？.!?])\s+/).map(value => value.trim()).filter(Boolean); let current = ''; let index = 0; for (const paragraph of paragraphs.length ? paragraphs : ['']) { if (current && current.length + paragraph.length + 1 > 900) { chunks.push({ id: `${item.id}-chunk-${index++}`, sectionId: item.id, content: current, chunkIndex: index, metadata: { ...item.locator, title: item.title, kind: item.kind } }); current = ''; } current += `${current ? '\n' : ''}${paragraph}`; } if (current) chunks.push({ id: `${item.id}-chunk-${index++}`, sectionId: item.id, content: current, chunkIndex: index, metadata: { ...item.locator, title: item.title, kind: item.kind } }); }
   for (const item of sections) { const blocks = (item.blocks || []).map((block, index) => ({ block, index, content: blockContent(block) })).filter(entry => entry.content); if (!blocks.length) continue; for (let index = chunks.length - 1; index >= 0; index -= 1) if (chunks[index].sectionId === item.id) chunks.splice(index, 1); for (const entry of blocks) chunks.push({ id: `${item.id}-block-${entry.index}`, sectionId: item.id, content: entry.content, chunkIndex: entry.index, metadata: { ...item.locator, title: item.title, kind: item.kind, blockType: entry.block.type || 'paragraph', blockIndex: entry.index } }); }
   return { fileType: type, sections, chunks, metadata: { ...metadataFor(name, ext), ...parsed.metadata } };
 }
 
-module.exports = { supported, extension, parseStructuredDocument };
+module.exports = { supported, extension, parseStructuredDocument, legacyOfficeStatus };
