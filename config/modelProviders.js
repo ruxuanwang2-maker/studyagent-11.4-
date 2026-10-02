@@ -8,6 +8,8 @@ const providers = [
   { id: 'moonshot', name: 'Moonshot / Kimi', apiType: 'openai-compatible', baseUrl: 'https://api.moonshot.cn/v1', models: [{ id: 'moonshot-v1-8k', label: 'Moonshot v1 8K', supportsStreaming: true }, { id: 'moonshot-v1-32k', label: 'Moonshot v1 32K', supportsStreaming: true }] },
   { id: 'zhipu', name: 'Zhipu / GLM', apiType: 'openai-compatible', baseUrl: 'https://open.bigmodel.cn/api/paas/v4', models: [{ id: 'glm-4-flash', label: 'GLM-4-Flash', supportsStreaming: true }, { id: 'glm-4-plus', label: 'GLM-4-Plus', supportsStreaming: true }] },
   { id: 'qwen', name: 'Qwen / DashScope', apiType: 'openai-compatible', baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1', models: [{ id: 'qwen-plus', label: 'Qwen Plus', supportsStreaming: true }, { id: 'qwen-turbo', label: 'Qwen Turbo', supportsStreaming: true }] },
+  { id: 'ollama', name: 'Ollama / Local', apiType: 'openai-compatible', baseUrl: 'http://127.0.0.1:11434/v1', models: [{ id: 'llama3.2', label: 'Llama 3.2', supportsStreaming: true }, { id: 'qwen2.5', label: 'Qwen 2.5', supportsStreaming: true }] },
+  { id: 'mathpix', name: 'Mathpix Math OCR', apiType: 'mathpix', baseUrl: 'https://api.mathpix.com/v3', models: [{ id: 'mathpix-text', label: 'Mathpix Text + LaTeX OCR', supportsMathOCR: true }] },
   { id: 'custom', name: 'Custom / OpenAI-Compatible', apiType: 'openai-compatible', baseUrl: '', models: [] }
 ];
 
