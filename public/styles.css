@@ -76,6 +76,43 @@
 .structured-table th,.structured-table td { border-bottom:1px solid var(--line); padding:8px 10px; text-align:left; vertical-align:top; white-space:pre-wrap; }
 .structured-table th { background:#f7f6ff; font-weight:700; }
 .structured-image { margin:16px 0; padding:12px; border:1px dashed #d9d6f4; border-radius:8px; background:#fbfaff; }
+.structured-source-image { display:block; max-width:100%; max-height:720px; height:auto; margin:10px auto 2px; border-radius:6px; background:#fff; box-shadow:0 5px 18px #48486a12; object-fit:contain; }
 .image-placeholder { margin-top:6px; color:var(--muted); font-size:11px; }
+.course-learning-summary { margin-top:16px; padding-top:12px; border-top:1px solid var(--line); }
+.course-summary-title { color:var(--muted); font-size:10px; font-weight:700; letter-spacing:.08em; text-transform:uppercase; }
+.course-summary-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(96px,1fr)); gap:8px; margin-top:9px; }
+.course-summary-grid span { padding:8px 9px; border:1px solid var(--line); border-radius:8px; color:var(--muted); font-size:10px; background:#fff; }
+.course-summary-grid b { display:block; margin-top:3px; color:var(--ink); font-size:15px; }
 .formula-actions { margin-top:8px; display:flex; justify-content:center; }
 .structured-vision { margin:14px 0; padding:13px 15px; border-left:3px solid var(--purple); border-radius:8px; background:#f7f5ff; color:#47436f; line-height:1.7; font-size:12px; }
+ .prompt-checks { display:flex; gap:14px; flex-wrap:wrap; justify-content:flex-end; }
+ .prompt-preview { margin:14px 0; padding:14px; background:linear-gradient(135deg,#f7f5ff,#fffaf5); border:1px solid #dcd6ff; border-radius:12px; }
+ .prompt-preview textarea { width:100%; min-height:150px; margin:10px 0; padding:12px; border:1px solid #d9d4f8; border-radius:10px; background:#fff; color:var(--ink); font:13px/1.55 ui-monospace,SFMono-Regular,Consolas,monospace; }
+ .prompt-preview-actions { display:flex; justify-content:flex-end; gap:8px; flex-wrap:wrap; }
+.account-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:16px; align-items:start; }
+.account-card { display:flex; flex-direction:column; gap:12px; }
+.account-card h2 { margin:0; }
+.account-card label { display:flex; flex-direction:column; gap:6px; color:var(--muted); font-size:12px; }
+.account-card input { width:100%; box-sizing:border-box; border:1px solid var(--line); border-radius:9px; padding:10px 11px; background:#fff; color:var(--ink); font:inherit; }
+.account-card input:disabled { background:#f5f4fb; color:var(--muted); }
+.account-actions { display:flex; gap:8px; flex-wrap:wrap; }
+.danger-card { border-color:#f1c8c8; }
+.graph-management { margin-top:16px; padding-top:14px; border-top:1px solid var(--line); }
+.graph-management-head { display:flex; justify-content:space-between; align-items:flex-start; gap:12px; margin-bottom:10px; }
+.graph-management-head > div { display:flex; flex-direction:column; gap:4px; }
+.graph-relation-form { display:grid; grid-template-columns:minmax(0,1fr) auto minmax(0,1fr) auto; gap:8px; margin-bottom:12px; }
+.graph-relation-form select { min-width:0; border:1px solid var(--line); border-radius:8px; padding:8px; background:#fff; color:var(--ink); font:inherit; }
+.graph-edge-list { display:flex; flex-direction:column; gap:7px; }
+.graph-edge-row { display:grid; grid-template-columns:minmax(0,1fr) auto minmax(0,1fr) auto; gap:8px; align-items:center; padding:8px 10px; border:1px solid var(--line); border-radius:8px; font-size:11px; }
+.graph-edge-row b { color:var(--purple); font-size:10px; white-space:nowrap; }
+@media (max-width:760px) { .graph-relation-form,.graph-edge-row { grid-template-columns:1fr; } .graph-edge-row b { justify-self:start; } }
+@media (max-width:760px) { .account-grid { grid-template-columns:1fr; } }
+.course-assignment { max-width: 150px; border: 1px solid #e2e0ee; border-radius: 7px; padding: 6px 8px; background: #fff; color: var(--ink); font-size: 11px; }
+.outline-file-name { margin: 0 0 12px; padding: 9px 10px; border: 1px solid #e3defe; border-radius: 8px; background: #f7f5ff; color: var(--ink); font-size: 11px; line-height: 1.45; font-weight: 700; overflow-wrap: anywhere; }
+.ai-formula { margin: 10px 0; padding: 8px 10px; overflow-x: auto; text-align: center; background: #faf9ff; border: 1px solid #e7e2ff; border-radius: 8px; }
+.ai-formula math { max-width: 100%; font-size: 1.08em; }
+.quiz-type { display: inline-flex; margin-bottom: 7px; padding: 3px 7px; border-radius: 999px; background: #f0edff; color: var(--purple); font-size: 10px; font-weight: 700; }
+.quiz-answer { margin: 10px 0; line-height: 1.7; }
+.review-self-test { grid-column: 1 / -1; margin-top: 2px; }
+.review-quiz-item { margin-top: 12px; padding: 13px 14px; border: 1px solid var(--line); border-radius: 10px; background: #fff; }
+.review-quiz-item h3 { margin: 0 0 9px; font-size: 14px; line-height: 1.55; }
