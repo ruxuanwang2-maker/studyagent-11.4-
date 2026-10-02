@@ -8,7 +8,16 @@ const files = [
   'services/rag/index.js',
   'services/memory/index.js',
   'services/agents/orchestrator.js',
-  'services/llm/providers.js'
+  'services/llm/providers.js',
+  'services/llm/store.js'
+  , 'services/auth/index.js',
+  'scripts/check-auth.mjs',
+  'scripts/check-learning-closure.mjs',
+  'scripts/check-math-ocr.mjs',
+  'scripts/check-math-ocr-http.mjs',
+  'scripts/check-multiformat-http.mjs',
+  'scripts/check-lecture-folder.mjs',
+  'scripts/check-all.mjs'
 ];
 for (const file of files) {
   const result = spawnSync(process.execPath, ['--check', file], { encoding: 'utf8' });
