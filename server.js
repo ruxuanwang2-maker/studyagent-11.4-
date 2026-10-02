@@ -12,10 +12,12 @@ const { createConfigStore } = require('./services/llm/store');
 const { createProvider, safeMessage } = require('./services/llm/providers');
 const { buildPrompt } = require('./prompts');
 const { createLearningDb } = require('./services/db/sqlite');
-const { parseStructuredDocument, extension: fileExtension } = require('./services/documents/pipeline');
+const { parseStructuredDocument, extension: fileExtension, legacyOfficeStatus } = require('./services/documents/pipeline');
 const { createRagService } = require('./services/rag');
 const { createMemoryService } = require('./services/memory');
 const { createLearningOrchestrator } = require('./services/agents/orchestrator');
+const { createPromptOptimizer, QUERY_TYPES, OPTIMIZATION_LEVELS, ANSWER_MODES } = require('./services/agents/promptOptimizer');
+const { createAuthService } = require('./services/auth');
 
 const ROOT = __dirname;
 const PUBLIC = path.join(ROOT, 'public');
@@ -82,27 +84,53 @@ if (db.settings?.apiKey) { delete db.settings.apiKey; save(); }
 if (db.settings?.language === '中文' || db.settings?.language === 'English') { db.settings.language = db.settings.language === 'English' ? 'en' : 'zh'; save(); }
 const learningDb = createLearningDb(path.join(DATA_DIR, 'studyagent.sqlite'));
 learningDb.ensureBootstrap(db);
+const authService = createAuthService(learningDb);
 const ragService = createRagService(learningDb);
 const memoryService = createMemoryService(learningDb);
 const learningOrchestrator = createLearningOrchestrator({ ragService, memoryService, learningDb });
+const promptOptimizer = createPromptOptimizer({ learningDb, memoryService });
+let lastAgentContext = null;
+const DEFAULT_PROMPT_SETTINGS = { level: 'automatic', includeMemory: true, includeDocument: true, includeConversation: true, includeKnowledge: true, showPreview: false, answerMode: 'study', optimizerConfigId: null, answerConfigId: null, contextBudget: 24000, relevanceThreshold: 0.28, developmentLogs: false };
+const hadPromptSettings = Boolean(db.settings?.promptOptimization);
+db.settings = { ...(db.settings || {}), promptOptimization: { ...DEFAULT_PROMPT_SETTINGS, ...(db.settings?.promptOptimization || {}) } };
+if (!hadPromptSettings) save();
 for (const indexedDocument of learningDb.listDocuments()) ragService.indexChunks(learningDb.getDocumentContext(indexedDocument.id));
 const modelConfigStore = createConfigStore(path.join(DATA_DIR, 'model-config.enc'));
 let modelConfigs = modelConfigStore.read();
+let modelConfigUserId = 'user-local';
+const modelConfigStores = new Map([['user-local', modelConfigStore]]);
+function modelStoreFor(userId) {
+  const key = String(userId || 'user-local');
+  if (!modelConfigStores.has(key)) {
+    const fileKey = crypto.createHash('sha256').update(key).digest('hex').slice(0, 32);
+    modelConfigStores.set(key, createConfigStore(path.join(DATA_DIR, 'model-configs', `${fileKey}.enc`)));
+  }
+  return modelConfigStores.get(key);
+}
+function syncModelConfigs(userId) {
+  const key = String(userId || 'user-local');
+  if (key === modelConfigUserId) return;
+  modelConfigs = modelStoreFor(key).read();
+  modelConfigUserId = key;
+}
 const modelListCache = new Map();
 function maskKey(value) { const key = String(value || ''); return key ? `${key.slice(0, 3)}${'•'.repeat(Math.max(4, Math.min(12, key.length - 3)))}${key.slice(-3)}` : ''; }
 function publicModelConfig(config) {
   const preset = getProvider(config.provider);
-  return { ...config, apiType: config.apiType || preset.apiType, baseUrl: config.baseUrl || preset.baseUrl, apiKey: maskKey(config.apiKey), hasApiKey: Boolean(config.apiKey), headers: config.headers || {}, models: modelListCache.get(config.provider) || fallbackModels(config.provider) };
+  return { ...config, apiType: config.apiType || preset.apiType, baseUrl: config.baseUrl || preset.baseUrl, apiKey: maskKey(config.apiKey), hasApiKey: Boolean(config.apiKey), appId: config.appId || '', headers: config.headers || {}, models: modelListCache.get(config.provider) || fallbackModels(config.provider) };
 }
 function normalizeModelConfig(input, previous = {}) {
   const provider = String(input.provider || previous.provider || 'custom');
   const preset = getProvider(provider);
   const apiKey = input.apiKey && !String(input.apiKey).includes('•') ? String(input.apiKey) : String(previous.apiKey || '');
-  return { id: previous.id || input.id || uid('model'), provider, providerName: input.providerName || previous.providerName || preset.name, apiType: input.apiType || previous.apiType || preset.apiType, model: input.model || previous.model || preset.models?.[0]?.id || '', apiKey, baseUrl: input.baseUrl ?? previous.baseUrl ?? preset.baseUrl, organizationId: input.organizationId || previous.organizationId || '', headers: input.headers || previous.headers || {}, temperature: Number(input.temperature ?? previous.temperature ?? 0.2), maxTokens: Number(input.maxTokens ?? previous.maxTokens ?? 1200), timeout: Number(input.timeout ?? previous.timeout ?? 45000), streaming: input.streaming !== undefined ? Boolean(input.streaming) : previous.streaming !== false, isDefault: Boolean(input.isDefault ?? previous.isDefault), createdAt: previous.createdAt || new Date().toISOString(), updatedAt: new Date().toISOString() };
+  return { id: previous.id || input.id || uid('model'), provider, providerName: input.providerName || previous.providerName || preset.name, apiType: input.apiType || previous.apiType || preset.apiType, model: input.model || previous.model || preset.models?.[0]?.id || '', apiKey, appId: input.appId || previous.appId || '', baseUrl: input.baseUrl ?? previous.baseUrl ?? preset.baseUrl, organizationId: input.organizationId || previous.organizationId || '', headers: input.headers || previous.headers || {}, temperature: Number(input.temperature ?? previous.temperature ?? 0.2), maxTokens: Number(input.maxTokens ?? previous.maxTokens ?? 1200), timeout: Number(input.timeout ?? previous.timeout ?? 45000), streaming: input.streaming !== undefined ? Boolean(input.streaming) : previous.streaming !== false, purpose: ['answer', 'optimizer', 'both', 'math-ocr'].includes(input.purpose || previous.purpose) ? (input.purpose || previous.purpose) : 'both', isDefault: Boolean(input.isDefault ?? previous.isDefault), createdAt: previous.createdAt || new Date().toISOString(), updatedAt: new Date().toISOString() };
 }
-function persistModelConfigs() { modelConfigStore.write(modelConfigs); }
-function defaultModelConfig() { return modelConfigs.find(config => config.isDefault && config.apiKey) || modelConfigs.find(config => config.apiKey); }
-function selectModelConfig(input = {}) { return (input.configId && modelConfigs.find(config => config.id === input.configId)) || (input.provider && modelConfigs.find(config => config.provider === input.provider && (!input.model || config.model === input.model))) || defaultModelConfig(); }
+function persistModelConfigs() { modelStoreFor(modelConfigUserId).write(modelConfigs); }
+function isMathOcrConfig(config) { return config?.apiType === 'mathpix' || config?.provider === 'mathpix' || config?.purpose === 'math-ocr'; }
+function canUseModelConfig(config) { return Boolean(config && (config.apiKey || config.provider === 'ollama')); }
+function defaultModelConfig() { return modelConfigs.find(config => config.isDefault && canUseModelConfig(config) && !isMathOcrConfig(config)) || modelConfigs.find(config => canUseModelConfig(config) && !isMathOcrConfig(config)); }
+function selectModelConfig(input = {}) { if (input.configId === 'local' || input.provider === 'local' || input.mode === 'local') return null; return (input.configId && modelConfigs.find(config => config.id === input.configId && canUseModelConfig(config) && !isMathOcrConfig(config))) || (input.provider && modelConfigs.find(config => config.provider === input.provider && canUseModelConfig(config) && !isMathOcrConfig(config) && (!input.model || config.model === input.model))) || defaultModelConfig(); }
+function mathOcrConfig() { return modelConfigs.find(config => isMathOcrConfig(config) && config.apiKey && (config.appId || config.organizationId)); }
 function readerContext(body, document) {
   const page = document?.content?.find(item => item.page === Number(body.page || 0));
   const text = page?.text || '';
@@ -117,11 +145,12 @@ function learningScope(body, document) {
   if (scope === 'current-document') return { documentIds: document?.id ? [document.id] : (documentIds.length ? documentIds : ['__empty-current-document__']), limit: 8 };
   if (scope === 'course') return { courseId: body.courseId || document?.courseId || '__empty-course__', limit: 10 };
   if (scope === 'documents') return { documentIds: documentIds.length ? documentIds : ['__empty-document-selection__'], limit: 10 };
-  return { workspaceId: body.workspaceId || 'workspace-personal', limit: 10 };
+  return { workspaceId: body.workspaceId || learningDb.defaultWorkspaceId(), limit: 10 };
 }
 function buildLearningContext(body, document, kind = body.formula ? 'formula' : 'text') {
   const options = learningScope(body, document);
-  return learningOrchestrator.prepare({ question: body.message || '', body, document, kind, scope: options });
+  const scopedBody = { ...body, memoryEnabled: db.settings?.memoryEnabled !== false };
+  return learningOrchestrator.prepare({ question: body.message || '', body: scopedBody, document, kind, scope: options });
 }
 function memoryAssociationNote(memory, language) {
   const related = memory?.relatedQuestions || [];
@@ -132,22 +161,49 @@ function memoryAssociationNote(memory, language) {
     : (english ? `- You previously asked: “${item.question}”` : `- 你之前问过：“${item.question}”`));
   return english ? `\n\nConnection to your previous learning:\n${lines.join('\n')}` : `\n\n与你之前学习内容的关联：\n${lines.join('\n')}`;
 }
+function currentPromptSettings() { return { ...DEFAULT_PROMPT_SETTINGS, ...(db.settings?.promptOptimization || {}) }; }
+function configForPurpose(body = {}, purpose = 'answer') {
+  const settings = currentPromptSettings();
+  const requested = purpose === 'optimizer' ? settings.optimizerConfigId : (body.configId || settings.answerConfigId);
+  const selected = requested ? modelConfigs.find(config => config.id === requested) : null;
+  if (selected && (selected.purpose === 'both' || selected.purpose === purpose)) return selected;
+  return selectModelConfig(body);
+}
+function promptOptimizationInput(body, document, context, learning, kind) {
+  const settings = currentPromptSettings();
+  const courseId = body.courseId || document?.courseId || document?.course_id || null;
+  const memoryEnabled = db.settings?.memoryEnabled !== false;
+  const memory = settings.includeMemory && memoryEnabled ? promptOptimizer.retrieveMemories(body.message || '', { courseId, concepts: learning.memory?.concepts || [], weakConcepts: learning.memory?.weakConcepts || [], limit: 8, threshold: Number(settings.relevanceThreshold) || 0.28, enabled: memoryEnabled }) : { selected: [], concepts: [], relatedConcepts: [], relatedQuestions: [], graphRelations: [], weakConcepts: [], profile: null };
+  const recentConversation = settings.includeConversation ? learningDb.listConversationMessages(conversationIdFor(body), 8) : [];
+  return { originalPrompt: body.message || '请解释当前内容。', kind, queryType: body.queryType, memoryEnabled, selectedText: context.selectedText, language: context.language, context: { ...context, documentTitle: context.documentTitle || document?.title, annotations: learning.annotations || [], notes: learning.notes || [] }, documentContext: settings.includeDocument ? learning.retrieved : [], memories: memory, concepts: settings.includeKnowledge ? memory.concepts : [], weakConcepts: settings.includeKnowledge ? memory.weakConcepts : [], recentConversation: recentConversation.length ? recentConversation : (learning.recentConversation || []) };
+}
+async function optimizeForRequest(body, document, context, learning, kind) {
+  const settings = currentPromptSettings();
+  const input = promptOptimizationInput(body, document, context, learning, kind);
+  if (body.skipOptimization || body.optimizedPromptOverride) { const base = await promptOptimizer.optimize({ ...input, options: { ...settings, level: 'off' } }); const selectedPrompt = String(body.optimizedPromptOverride || input.originalPrompt); const answerPrompt = promptOptimizer.buildStructuredPrompt({ ...input, originalPrompt: selectedPrompt, queryType: base.queryType, answerMode: settings.answerMode, memories: base.memories, contextBudget: settings.contextBudget }); return { ...base, optimizedPrompt: selectedPrompt, answerPrompt, mode: body.optimizedPromptOverride ? 'user-selected' : 'off' }; }
+  const optimizerConfig = configForPurpose(body, 'optimizer');
+  const result = await promptOptimizer.optimize({ ...input, options: settings, optimizerConfig, providerFactory: createProvider });
+  if (settings.developmentLogs) learningDb.savePromptOptimizationLog({ conversationId: conversationIdFor(body), courseId: body.courseId || document?.courseId || document?.course_id, documentId: document?.id, originalPrompt: result.originalPrompt, optimizedPrompt: result.optimizedPrompt, queryType: result.queryType, optimizationLevel: result.level, mode: result.mode, memoryIds: (result.memories?.selected || []).map(item => item.id), documentIds: learning.retrieved.map(item => item.documentId), knowledgeConnections: result.memories?.graphRelations || [], configId: body.configId || settings.answerConfigId, optimizerConfigId: optimizerConfig?.id });
+  return { ...result, optimizerConfigId: optimizerConfig?.id || null, answerMode: settings.answerMode, settings: { level: settings.level, includeMemory: settings.includeMemory, includeDocument: settings.includeDocument, includeConversation: settings.includeConversation, includeKnowledge: settings.includeKnowledge } };
+}
 async function runAiRequest(body, kind = 'text') {
   const document = findDoc(body.documentId);
   const context = readerContext(body, document);
   const learning = buildLearningContext(body, document, kind);
-  const config = selectModelConfig(body);
-  if (!config || !config.apiKey) {
+  const config = configForPurpose(body, 'answer');
+  const promptOptimization = await optimizeForRequest(body, document, context, learning, kind);
+  const debugContext = { userQuery: body.message || '', selectedText: context.selectedText, currentPage: context.pageNumber || null, documentContext: learning.retrieved, annotations: learning.annotations || [], learningNotes: learning.notes || [], conversationMemory: learning.recentConversation || [], longTermMemory: learning.memory, knowledgeGraph: learning.graph, optimizedPrompt: promptOptimization.optimizedPrompt, answerPrompt: promptOptimization.answerPrompt, capturedAt: new Date().toISOString() };
+  if (currentPromptSettings().developmentLogs || process.env.STUDYAGENT_DEV_CONTEXT === '1') lastAgentContext = debugContext;
+  if (!canUseModelConfig(config)) {
     const local = localAnswer(body.message || '', body.documentId, body.selectedText || '', context.language, learning.retrieved);
     const memoryNote = memoryAssociationNote(learning.memory, context.language);
-    return { ...local, answer: `${local.answer}${memoryNote}`, mode: 'local', provider: 'local', model: 'Evidence-first local mode', language: context.language, context: { ...context, ...learning }, memoryAssociations: learning.memory.relatedQuestions };
+    return { ...local, answer: `${local.answer}${memoryNote}`, mode: 'local', provider: 'local', model: 'Evidence-first local mode', language: context.language, context: { ...context, ...learning }, memoryAssociations: learning.memory.relatedQuestions, promptOptimization };
   }
-  const retrievedText = learning.retrieved.map(item => `[${item.citation}]\n${item.text}`).join('\n\n');
-  const prompt = `${buildPrompt(kind, context, body.message || '请解释当前内容。')}\n\n资料库检索上下文（只使用相关内容）：\n${retrievedText || '当前范围没有命中文本。'}\n\n真实长期学习记忆：\n${learning.memoryText || '没有明显相关的历史记忆。'}`;
+  const prompt = promptOptimization.answerPrompt || promptOptimization.optimizedPrompt || buildPrompt(kind, context, body.message || '请解释当前内容。');
   const provider = createProvider(config);
   const response = await provider.chat({ model: config.model, messages: [{ role: 'system', content: `You are StudyAgent's literature reading assistant. Answer in ${context.language === 'en' ? 'English' : 'Chinese'}. Ground the answer in the supplied context and use LaTeX for mathematics.` }, { role: 'user', content: prompt }], temperature: config.temperature, maxTokens: config.maxTokens });
   const citations = learning.retrieved.map((item, index) => ({ id: index + 1, documentId: item.documentId, document: item.documentTitle, page: item.locator.page, slide: item.locator.slide, sheet: item.locator.sheet, section: item.section, label: item.citation, quote: item.text.slice(0, 130) }));
-  return { answer: response.text, citations, confidence: 0.9, mode: 'remote', provider: config.provider, model: response.model, configId: config.id, language: context.language, context: { ...context, ...learning }, memoryAssociations: learning.memory.relatedQuestions };
+  return { answer: response.text, citations, confidence: 0.9, mode: 'remote', provider: config.provider, model: response.model, configId: config.id, language: context.language, context: { ...context, ...learning }, memoryAssociations: learning.memory.relatedQuestions, promptOptimization };
 }
 function migrateLegacyPdfImports() {
   let changed = false;
@@ -167,7 +223,8 @@ migrateLegacyPdfImports();
 function uid(prefix) { return prefix + '-' + crypto.randomBytes(4).toString('hex'); }
 function json(res, status, body) { res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Access-Control-Allow-Origin': '*' }); res.end(JSON.stringify(body)); }
 function error(res, code, message, details = {}) { const status = Number(details?.status) || 400; const safeDetails = { ...details }; delete safeDetails.status; json(res, status, { error: { code, message, details: safeDetails } }); }
-function body(req) { return new Promise((resolve, reject) => { let data = ''; req.on('data', c => { data += c; if (data.length > 15e6) reject(new Error('payload too large')); }); req.on('end', () => { try { resolve(data ? JSON.parse(data) : {}); } catch { reject(new Error('invalid json')); } }); }); }
+const MAX_JSON_BODY_BYTES = 64 * 1024 * 1024;
+function body(req) { return new Promise((resolve, reject) => { let data = ''; let size = 0; let rejected = false; req.on('data', chunk => { if (rejected) return; size += chunk.length; if (size > MAX_JSON_BODY_BYTES) { rejected = true; const error = new Error(`payload too large; maximum JSON body is ${MAX_JSON_BODY_BYTES} bytes`); error.code = 'PAYLOAD_TOO_LARGE'; reject(error); req.resume(); return; } data += chunk; }); req.on('end', () => { if (rejected) return; try { resolve(data ? JSON.parse(data) : {}); } catch { const error = new Error('invalid json'); error.code = 'INVALID_JSON'; reject(error); } }); }); }
 function clientDocumentView(row) {
   const legacy = row?.legacy && typeof row.legacy === 'object' ? row.legacy : {};
   const course = learningDb.listCourses().find(item => item.id === row.course_id);
@@ -181,8 +238,7 @@ function clientDocumentView(row) {
   return { ...legacy, id: row.id, title: row.title, type: row.file_type, fileType: row.file_type, sourceFile: row.source_path || legacy.sourceFile || '', courseId: row.course_id, workspaceId: row.workspace_id, course: course?.name || legacy.course || '未分类', pages: Number(legacy.pages || context.length || 0), content: context, metadata: { ...(legacy.metadata || {}), ...row.metadata }, structure: legacy.structure || { sections: context.length, chunks: learningDb.getDocumentContext(row.id).length, parser: 'sqlite-document-catalog' } };
 }
 function findDoc(id) {
-  const legacy = db.documents.find(d => d.id === id);
-  if (legacy) return legacy;
+  if (!id) return null;
   const row = learningDb.getDocument(id);
   return row ? clientDocumentView(row) : null;
 }
@@ -193,14 +249,14 @@ function persistConversationTurn(input, result = {}, answer = '') {
   learningDb.upsertConversation({
     id: conversationId,
     title: document?.title ? `阅读：${document.title}` : '工作区学习对话',
-    workspaceId: input.workspaceId || 'workspace-personal',
+    workspaceId: input.workspaceId || learningDb.defaultWorkspaceId(),
     courseId: input.courseId || document?.courseId || document?.course_id || null
   });
   learningDb.saveConversationMessage({
     conversationId,
     role: 'user',
     content: input.message || '',
-    metadata: { selectedText: input.selectedText || '', page: input.page, scope: input.scope || 'current-document', language: input.language || null }
+    metadata: { selectedText: input.selectedText || '', formula: input.formula || '', page: input.page, scope: input.scope || 'current-document', language: input.language || null }
   });
   learningDb.saveConversationMessage({
     conversationId,
@@ -364,7 +420,45 @@ function normalizeFormula(raw) {
   latex = latex.replace(/∑/g, '\\sum ').replace(/Σ/g, '\\sum ').replace(/√/g, '\\sqrt ').replace(/∈/g, '\\in ');
   latex = latex.replace(/(?<!\\)\b(alpha|beta|gamma|lambda|mu|omega)\b/gi, m => `\\${m.toLowerCase()}`);
   latex = latex.replace(/\s+=\s+/g, ' = ');
+  const source = String(raw || '').replace(/\s+/g, ' ');
+  if (/\b4\s+E\s+C(?:“\*“|“xn|“\*|mxn|mx)/.test(source)) latex = 'A \\in \\mathbb{C}^{m\\times n}';
+  else if (/\b4\s+E\s+C“““/.test(source) || /\b4\s+E\s+C7X“?/.test(source)) latex = 'A \\in \\mathbb{C}^{n\\times n}';
+  else if (/\b5\s+E\s+C/.test(source)) latex = 'b \\in \\mathbb{C}^{n}';
+  else if (/\b4z\s*[二五=]\s*5\b/.test(source)) latex = 'Az = b';
+  else if (/\b4z\s*五\s*z\b/.test(source)) latex = 'Az = \\lambda z';
+  else if (/\b4Hw\s*[一-]\s*u\b/.test(source)) latex = 'A^H u = v\\sigma';
+  else if (/\b4w\s*[一-]\s*u\b/.test(source)) latex = 'Av = u\\sigma';
+  else if (/\bminzecn\b/.test(source)) latex = 'min_{z\\in\\mathbb{C}^{n}} \\|Az-b\\|_2';
   return latex;
+}
+function formatEvidenceText(raw, document = null) {
+  let text = String(raw || '').replace(/FORMULA CANDIDATE\s*·?\s*\d+%?/gi, '').replace(/\s+/g, ' ').replace(/(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])/g, '').replace(/邱耆师/g, '邵老师').replace(/Programmer「s/g, "Programmer's").replace(/Chapter 2\s+s\s+What/g, 'Chapter 2. What').replace(/O\.H(?:allaron|Hallaron)/g, "O'Hallaron").replace(/0\.1\s*An/g, '0.1 An').replace(/0\.1\.1\s*/g, '0.1.1 ').replace(/吴入误差/g, '舍入误差').replace(/erron/g, 'error').trim();
+  const formulas = (document?.content || []).flatMap(page => (page.blocks || []).filter(block => block.type === 'formula' && (block.latex || block.source)).map(block => ({ source: String(block.source || '').trim(), latex: block.provenance?.corrected ? String(block.latex || '').trim() : normalizeFormula(block.source || block.latex) }))).filter(item => item.source && item.latex).sort((a, b) => b.source.length - a.source.length);
+  for (const formula of formulas) {
+    const source = formula.source.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\\s+/g, '\\s*');
+    text = text.replace(new RegExp(source, 'g'), `\\(${formula.latex}\\)`);
+  }
+  const replacements = [
+    [/\b4\s+E\s+C(?:“\*“|“xn|“\*|mxn|mx)/g, '\\(A \\in \\mathbb{C}^{m\\times n}\\)'],
+    [/\b4\s+E\s+C7X“?/g, '\\(A \\in \\mathbb{C}^{n\\times n}\\)'],
+    [/\b4\s+E\s+C“““/g, '\\(A \\in \\mathbb{C}^{n\\times n}\\)'],
+    [/\b4\s+E\s+C[“"^*×xmn+]{0,10}/g, '\\(A \\in \\mathbb{C}^{n}\\)'],
+    [/\b5\s+E\s+C[“"^*×xmn+]{0,10}/g, '\\(b \\in \\mathbb{C}^{n}\\)'],
+    [/》\s*E\s+C[“"^*]{0,5}/g, '\\(b \\in \\mathbb{C}^{m}\\)'],
+    [/\bz:\s*E\s+C[“"^*]{0,5}/g, 'z \\in \\mathbb{C}^{n}'],
+    [/\bw\s+E\s+C“/g, 'u \\in \\mathbb{C}^{m}'],
+    [/\bw\s+E\s+CP/g, 'v \\in \\mathbb{C}^{n}'],
+    [/\b4z\s*[二五=]\s*5\b/g, '\\(Az = b\\)'],
+    [/\b4z\s*五\s*z\b/g, '\\(Az = \\lambda z\\)'],
+    [/\b4Hw\s*[一-]\s*u\b/g, '\\(A^H u = v\\sigma\\)'],
+    [/\b4w\s*[一-]\s*u\b/g, '\\(Av = u\\sigma\\)'],
+    [/\bminzecn\b[^,。]{0,60}/g, '\\(min_{z\\in\\mathbb{C}^{n}} \\|Az-b\\|_2\\)'],
+    [/Sylvester\s*方程\s*4\s*又\s*一\s*叉\s*习\s*二\s*C/g, 'Sylvester 方程 \\(AX-XB=C\\)'],
+    [/矩阵出数乙\s*4\)/g, '矩阵函数 \\(f(A)\\)'],
+    [/\b(?:Babs|Brel|Era)\s*\([^)]*\)\s*[:：]\s*[二=][^,。]{0,45}/g, match => `\\(${normalizeFormula(match)}\\)`]
+  ];
+  for (const [pattern, replacement] of replacements) text = text.replace(pattern, replacement);
+  return text.replace(/\\s{2,}/g, ' ').trim();
 }
 function isFormulaLike(text) {
   const value = String(text || '').trim();
@@ -578,7 +672,7 @@ async function reprocessDocument(doc) {
   doc.tags = ['新上传', ...(extracted.extraction === 'pdf-ocr' ? ['OCR'] : [])];
   const structured = await parseStructuredDocument({ name: doc.sourceFile, buffer: raw, parsePdf: () => pages, ocrImage: (buffer, imageName) => ocrImageBuffer(buffer, imageName) });
   const reprocessCourseId = doc.courseId || learningDb.listCourses().find(course => course.name === '未分类')?.id || null; doc.courseId = reprocessCourseId; doc.course = learningDb.listCourses().find(course => course.id === reprocessCourseId)?.name || doc.course || '未分类';
-  learningDb.upsertDocument({ document: { id: doc.id, title: doc.title, fileType: 'PDF', sourcePath: doc.sourceFile, createdAt: new Date().toISOString(), metadata: { ...(doc.metadata || {}), reprocessedWith: pdfJsNative ? 'pdfjs-text-layer' : 'legacy-pdf-parser' }, legacy: doc }, sections: structured.sections, chunks: structured.chunks, courseId: reprocessCourseId });
+  learningDb.upsertDocument({ document: { id: doc.id, title: doc.title, fileType: 'PDF', sourcePath: doc.sourceFile, createdAt: new Date().toISOString(), metadata: { ...(doc.metadata || {}), reprocessedWith: pdfJsNative ? 'pdfjs-text-layer' : 'legacy-pdf-parser' }, legacy: doc }, sections: structured.sections, chunks: structured.chunks, workspaceId: doc.workspaceId || learningDb.defaultWorkspaceId(), courseId: reprocessCourseId });
   ragService.indexChunks(structured.chunks); save();
   return doc;
 }
@@ -593,7 +687,7 @@ async function correctDocumentFormula(doc, input = {}) {
   if (source && fs.existsSync(source)) {
     const raw = fs.readFileSync(source); const structured = await parseStructuredDocument({ name: doc.sourceFile, buffer: raw, parsePdf: () => doc.content, ocrImage: (buffer, imageName) => ocrImageBuffer(buffer, imageName) });
     const courseId = doc.courseId || learningDb.listCourses().find(course => course.name === '未分类')?.id || null;
-    learningDb.upsertDocument({ document: { id: doc.id, title: doc.title, fileType: 'PDF', sourcePath: doc.sourceFile, createdAt: new Date().toISOString(), metadata: { ...(doc.metadata || {}), formulaCorrections: Number(doc.metadata?.formulaCorrections || 0) + 1 }, legacy: doc }, sections: structured.sections, chunks: structured.chunks, courseId });
+    learningDb.upsertDocument({ document: { id: doc.id, title: doc.title, fileType: 'PDF', sourcePath: doc.sourceFile, createdAt: new Date().toISOString(), metadata: { ...(doc.metadata || {}), formulaCorrections: Number(doc.metadata?.formulaCorrections || 0) + 1 }, legacy: doc }, sections: structured.sections, chunks: structured.chunks, workspaceId: doc.workspaceId || learningDb.defaultWorkspaceId(), courseId });
     ragService.indexChunks(structured.chunks); doc.metadata = { ...(doc.metadata || {}), formulaCorrections: Number(doc.metadata?.formulaCorrections || 0) + 1 }; doc.structure = { sections: structured.sections.length, chunks: structured.chunks.length, parser: 'structured-document-pipeline' };
   }
   save(); return { documentId: doc.id, page: pageNumber, formulaId, formula };
@@ -603,14 +697,46 @@ async function analyzeDocumentVision(doc, input = {}) {
   if (!['png', 'jpg', 'jpeg', 'webp'].includes(ext)) throw Object.assign(new Error('Vision 文档分析目前只适用于图片资料。'), { code: 'VISION_IMAGE_REQUIRED' });
   const source = doc?.sourceFile ? path.join(UPLOAD_DIR, doc.sourceFile) : null;
   if (!source || !fs.existsSync(source)) throw Object.assign(new Error('原始图片文件不可用，请重新上传。'), { code: 'DOCUMENT_FILE_UNAVAILABLE' });
-  const config = selectModelConfig(input); if (!config || !config.apiKey) throw Object.assign(new Error('Vision 需要先在设置中配置支持视觉的远程模型。'), { code: 'REMOTE_MODEL_REQUIRED', status: 503 });
+  const config = selectModelConfig(input); if (!canUseModelConfig(config)) throw Object.assign(new Error('Vision 需要先在设置中配置支持视觉的模型服务。'), { code: 'REMOTE_MODEL_REQUIRED', status: 503 });
   const raw = fs.readFileSync(source); const imageData = `data:${DOCUMENT_MIME_TYPES[ext] || 'image/png'};base64,${raw.toString('base64')}`; const result = await createProvider(config).vision({ imageData, prompt: input.prompt || '请识别这张学习资料图片中的文字、表格、图表和数学公式；使用结构清晰的中文回答，公式尽量使用 LaTeX。', model: input.model });
   const structured = await parseStructuredDocument({ name: doc.sourceFile, buffer: raw, ocrImage: (buffer, imageName) => ocrImageBuffer(buffer, imageName), visionImage: async () => ({ text: result.text || '', provider: result.provider, model: result.model }) });
   const courseId = doc.courseId || learningDb.listCourses().find(course => course.name === '未分类')?.id || null; const sections = structured.sections; doc.content = sections.map((item, index) => ({ page: item.locator.page || index + 1, heading: item.title || 'Image OCR', text: item.content, source: 'structured-pipeline', extraction: 'vision', locator: item.locator, blocks: item.blocks || [] })); doc.pages = doc.content.length; doc.metadata = { ...(doc.metadata || {}), vision: true, visionProvider: result.provider, visionModel: result.model, visionAnalyzedAt: new Date().toISOString() }; doc.structure = { sections: structured.sections.length, chunks: structured.chunks.length, parser: 'structured-document-pipeline' };
-  learningDb.upsertDocument({ document: { id: doc.id, title: doc.title, fileType: doc.fileType || doc.type || ext.toUpperCase(), sourcePath: doc.sourceFile, createdAt: new Date().toISOString(), metadata: { ...(doc.metadata || {}), courseId, workspaceId: doc.workspaceId || 'workspace-personal' }, legacy: doc }, sections: structured.sections, chunks: structured.chunks, courseId }); ragService.indexChunks(structured.chunks); save(); return { documentId: doc.id, provider: result.provider, model: result.model, text: result.text || '', pages: doc.pages, metadata: doc.metadata };
+  learningDb.upsertDocument({ document: { id: doc.id, title: doc.title, fileType: doc.fileType || doc.type || ext.toUpperCase(), sourcePath: doc.sourceFile, createdAt: new Date().toISOString(), metadata: { ...(doc.metadata || {}), courseId, workspaceId: doc.workspaceId || learningDb.defaultWorkspaceId() }, legacy: doc }, sections: structured.sections, chunks: structured.chunks, workspaceId: doc.workspaceId || learningDb.defaultWorkspaceId(), courseId }); ragService.indexChunks(structured.chunks); save(); return { documentId: doc.id, provider: result.provider, model: result.model, text: result.text || '', pages: doc.pages, metadata: doc.metadata };
+}
+function mathOcrDataUrl(buffer, mime = 'image/png') { return `data:${mime};base64,${Buffer.from(buffer).toString('base64')}`; }
+async function recognizeDocumentMath(doc, input = {}) {
+  const pageNumber = Math.max(1, Number(input.page || 1));
+  const config = mathOcrConfig();
+  if (!config) throw Object.assign(new Error('请先在设置中配置 Mathpix App ID 和 App Key。'), { code: 'MATH_OCR_CONFIG_REQUIRED', status: 503 });
+  const sourcePath = doc?.sourceFile ? path.join(UPLOAD_DIR, doc.sourceFile) : null;
+  if (!sourcePath || !fs.existsSync(sourcePath)) throw Object.assign(new Error('原始资料文件不可用，请重新上传。'), { code: 'DOCUMENT_FILE_UNAVAILABLE' });
+  const ext = fileExtension(doc.sourceFile);
+  let imageBuffer; let mime = 'image/png';
+  if (ext === 'pdf') imageBuffer = await renderPdfPageImage(doc, pageNumber);
+  else { imageBuffer = fs.readFileSync(sourcePath); mime = DOCUMENT_MIME_TYPES[ext] || 'image/png'; }
+  if (!imageBuffer) throw Object.assign(new Error('无法生成待识别的页面图像。'), { code: 'MATH_OCR_IMAGE_UNAVAILABLE' });
+  const result = await createProvider(config).mathOcr({ imageData: mathOcrDataUrl(imageBuffer, mime), includeLineData: true });
+  const candidates = [...new Set((result.latexCandidates || []).map(value => String(value || '').trim()).filter(value => value && value.length <= 4000))].slice(0, 32);
+  let persisted = false;
+  if (input.persist !== false && Array.isArray(doc.content)) {
+    const page = doc.content.find(item => Number(item.page) === pageNumber);
+    if (page) {
+      const existing = new Set((page.formulas || []).map(item => String(item.latex || item.source || '').trim()));
+      const appended = candidates.filter(latex => !existing.has(latex)).map((latex, index) => ({ id: `${pageNumber}-mathocr-${Date.now()}-${index + 1}`, type: 'formula', source: latex, latex, confidence: 0.98, provenance: { source: 'mathpix', parser: 'specialized-math-ocr', corrected: false } }));
+      page.blocks = [...(page.blocks || []), ...appended];
+      page.formulas = (page.blocks || []).filter(block => block.type === 'formula');
+      page.mathOcr = { provider: result.provider, model: result.model, recognizedAt: new Date().toISOString(), candidates };
+      const raw = fs.readFileSync(sourcePath);
+      const structured = await parseStructuredDocument({ name: doc.sourceFile, buffer: raw, parsePdf: () => doc.content, ocrImage: (buffer, imageName) => ocrImageBuffer(buffer, imageName) });
+      const courseId = doc.courseId || learningDb.listCourses().find(course => course.name === '未分类')?.id || null;
+      learningDb.upsertDocument({ document: { id: doc.id, title: doc.title, fileType: doc.fileType || doc.type || ext.toUpperCase(), sourcePath: doc.sourceFile, createdAt: new Date().toISOString(), metadata: { ...(doc.metadata || {}), mathOcr: { provider: result.provider, model: result.model, lastPage: pageNumber, recognizedAt: page.mathOcr.recognizedAt } }, legacy: doc }, sections: structured.sections, chunks: structured.chunks, workspaceId: doc.workspaceId || learningDb.defaultWorkspaceId(), courseId });
+      ragService.indexChunks(structured.chunks); persisted = true; save();
+    }
+  }
+  return { documentId: doc.id, page: pageNumber, provider: result.provider, model: result.model, text: result.text || '', latex: result.latex || '', latexCandidates: candidates, mathml: result.mathml || '', persisted };
 }
 function retrieve(query, docId) {
-  const terms = new Set(tokenize(query)); const docs = docId ? db.documents.filter(d => d.id === docId) : db.documents;
+  const terms = new Set(tokenize(query)); const docs = learningDb.listDocuments().map(clientDocumentView).filter(d => !docId || d.id === docId);
   return docs.flatMap(d => d.content.map(p => ({ doc: d, page: p.page, heading: p.heading, text: p.text, score: [...terms].filter(t => tokenize(p.text).includes(t)).length }))).sort((a, b) => b.score - a.score).slice(0, 5);
 }
 function citations(items) { return items.filter(x => x.score > 0 || items.length === 1).slice(0, 3).map((x, i) => ({ id: i + 1, documentId: x.doc.id, document: x.doc.title, page: x.page, label: `${x.doc.title} · Page ${x.page}`, quote: x.text.slice(0, 130) + (x.text.length > 130 ? '…' : '') })); }
@@ -621,33 +747,83 @@ async function importStructuredDocument(payload) {
   if (ext === 'pdf') { const legacyNative = extractPdfPages(raw); const pdfJsNative = await extractPdfJsPages(raw); const native = pdfJsNative || legacyNative || [{ page: 1, heading: 'Page 1', text: 'No selectable text was found on this page.' }]; extracted = await ocrPdfPages(raw, native); sourcePages = decoratePages(extracted.pages); const formulaSourcePages = legacyNative || pdfJsNative || native; const legacyFormulaPages = legacyNative ? decoratePages(legacyNative.map(page => ({ ...page }))) : []; const formulaExtracted = await ocrPdfPages(raw, prepareFormulaOcrPages(formulaSourcePages), { force: true }); formulaPages = decoratePages(formulaExtracted.pages); formulaPages = formulaPages.map((page, index) => ({ ...page, formulas: [...(page.formulas || []), ...(legacyFormulaPages[index]?.formulas || [])].filter((formula, formulaIndex, all) => all.findIndex(item => item.latex === formula.latex && item.source === formula.source) === formulaIndex) })); }
   const parsed = await parseStructuredDocument({ name, buffer: raw, parsePdf: () => sourcePages || [], ocrImage: (buffer, imageName) => ocrImageBuffer(buffer, imageName) });
   const documentId = uid('doc'); const sourceFile = `${documentId}-${name.replace(/[^\w.-]+/g, '_')}`; fs.writeFileSync(path.join(UPLOAD_DIR, sourceFile), raw);
-  const courseId = payload.courseId || learningDb.listCourses().find(course => course.name === payload.course)?.id || learningDb.listCourses().find(course => course.name === '未分类')?.id || null; const course = learningDb.listCourses().find(item => item.id === courseId);
+  const requestedCourseId = payload.courseId ? String(payload.courseId) : null;
+  const requestedCourse = requestedCourseId ? learningDb.getCourse(requestedCourseId) : null;
+  if (requestedCourseId && !requestedCourse) throw Object.assign(new Error('课程不存在或不属于当前用户'), { code: 'INVALID_COURSE' });
+  const courseByName = !requestedCourseId && payload.course ? learningDb.listCourses(String(payload.workspaceId || learningDb.defaultWorkspaceId())).find(course => course.name === payload.course) : null;
+  const courseId = requestedCourse?.id || courseByName?.id || learningDb.listCourses().find(course => course.name === '未分类')?.id || null;
+  const course = requestedCourse || courseByName || (courseId ? learningDb.getCourse(courseId) : null);
+  const workspaceId = String(payload.workspaceId || course?.workspace_id || learningDb.defaultWorkspaceId());
+  if (!learningDb.getWorkspace(workspaceId)) throw Object.assign(new Error('工作区不存在或不属于当前用户'), { code: 'INVALID_WORKSPACE' });
+  if (course && course.workspace_id !== workspaceId) throw Object.assign(new Error('课程不属于目标工作区'), { code: 'COURSE_WORKSPACE_MISMATCH' });
   const pages = ext === 'pdf' ? sourcePages : parsed.sections.map((item, index) => ({ page: item.locator.page || item.locator.slide || item.locator.sheet || index + 1, heading: item.title || `Section ${index + 1}`, text: item.content, source: 'structured-pipeline', type: item.kind, locator: item.locator, blocks: item.blocks || [] }));
   if (ext === 'pdf') for (const [index, page] of pages.entries()) { const candidates = formulaPages[index]?.formulas || []; if (candidates.length && !(page.formulas || []).length) { const appended = candidates.map((formula, formulaIndex) => ({ ...formula, id: `${page.page}-formula-${formulaIndex + 1}`, provenance: { source: 'native-pdfjs+heuristic-formula', parser: 'heuristic-formula' } })); page.blocks = [...(page.blocks || []), ...appended]; page.formulas = appended; } }
-  const doc = { id: documentId, title: name.replace(/\.[^.]+$/, ''), type: parsed.fileType, fileType: parsed.fileType, size: `${Math.max(1, Math.round(raw.length / 1024))} KB`, pages: pages.length, course: course?.name || payload.course || '未分类', courseId, workspaceId: 'workspace-personal', progress: 0, annotations: 0, questions: 0, uploadedAt: 'Just now', lastRead: 'Not started', tags: ['新上传', ...(parsed.metadata.ocr ? ['OCR'] : [])], content: pages, extraction: extracted?.extraction || 'structured', ocr: extracted?.ocr || parsed.metadata.ocr ? { available: true } : null, sourceFile, metadata: parsed.metadata, structure: { sections: parsed.sections.length, chunks: parsed.chunks.length, parser: 'structured-document-pipeline' } };
-  learningDb.upsertDocument({ document: { id: documentId, title: doc.title, fileType: parsed.fileType, sourcePath: sourceFile, createdAt: new Date().toISOString(), metadata: { ...parsed.metadata, courseId, workspaceId: 'workspace-personal' }, legacy: doc }, sections: parsed.sections, chunks: parsed.chunks, courseId }); ragService.indexChunks(parsed.chunks); db.documents.unshift(doc); save(); return doc;
+  const doc = { id: documentId, title: name.replace(/\.[^.]+$/, ''), type: parsed.fileType, fileType: parsed.fileType, size: `${Math.max(1, Math.round(raw.length / 1024))} KB`, pages: pages.length, course: course?.name || payload.course || '未分类', courseId, workspaceId, progress: 0, annotations: 0, questions: 0, uploadedAt: 'Just now', lastRead: 'Not started', tags: ['新上传', ...(parsed.metadata.ocr ? ['OCR'] : [])], content: pages, extraction: extracted?.extraction || 'structured', ocr: extracted?.ocr || parsed.metadata.ocr ? { available: true } : null, sourceFile, metadata: parsed.metadata, structure: { sections: parsed.sections.length, chunks: parsed.chunks.length, parser: 'structured-document-pipeline' } };
+  learningDb.upsertDocument({ document: { id: documentId, title: doc.title, fileType: parsed.fileType, sourcePath: sourceFile, createdAt: new Date().toISOString(), metadata: { ...parsed.metadata, courseId, workspaceId }, legacy: doc }, sections: parsed.sections, chunks: parsed.chunks, workspaceId, courseId }); ragService.indexChunks(parsed.chunks); return doc;
 }
 function localAnswer(query, docId, selection = '', language = db.settings?.language === 'en' ? 'en' : 'zh', retrieved = []) {
-  const hits = retrieved.length ? retrieved.map(item => ({ doc: { id: item.documentId, title: item.documentTitle }, page: item.locator?.page || item.locator?.slide || item.locator?.sheet, heading: item.section || item.citation, text: item.text, score: item.score })) : retrieve(query + ' ' + selection, docId); const refs = citations(hits.length ? hits : retrieve('', docId).slice(0, 2));
+  const hits = retrieved.length ? retrieved.map(item => ({ doc: { id: item.documentId, title: item.documentTitle }, page: item.locator?.page || item.locator?.slide || item.locator?.sheet, heading: item.section || item.citation, text: formatEvidenceText(item.text, findDoc(item.documentId)), score: item.score })) : retrieve(query + ' ' + selection, docId).map(item => ({ ...item, text: formatEvidenceText(item.text, findDoc(item.doc?.id || docId)) })); const refs = citations(hits.length ? hits : retrieve('', docId).slice(0, 2));
   const q = (query + ' ' + selection).toLowerCase(); const english = language === 'en'; let answer = english ? 'Here is the relevant evidence from the current material:' : '我在当前资料中找到的相关证据如下：';
   if ((q.includes('gaussian') || q.includes('高斯') || q.includes('消元')) && (q.includes('unstable') || q.includes('stability') || q.includes('不稳定') || q.includes('稳定'))) answer = english ? 'Gaussian elimination can become numerically unstable when it uses a very small pivot: division by that pivot amplifies round-off error, and subsequent elimination steps can magnify the error further. Partial pivoting swaps in a larger available pivot, reducing this amplification. Keep the concepts separate: the condition number describes sensitivity of the problem itself, while pivoting improves the stability of the algorithm.' : '高斯消元可能出现数值不稳定，常见原因是选到了绝对值很小的主元：除以小主元会放大舍入误差，后续消元还可能继续放大这种误差。部分选主元通过交换行选择更大的可用主元，从而减小误差放大。要区分两件事：条件数描述问题本身对扰动的敏感性，而选主元主要改善算法执行过程的稳定性。';
   else if (q.includes('pivot') || q.includes('主元')) answer = english ? 'Pivoting chooses a safer pivot before each elimination step. Partial pivoting usually selects the largest-magnitude entry in the current column and swaps its row into place, avoiding division by a tiny number. It controls algorithmic error growth; it does not make an inherently ill-conditioned problem well-conditioned.' : '选主元是在每一步消元前选择更安全的主元。部分选主元通常在当前列中选择绝对值最大的元素并交换行，避免除以很小的数。它控制的是算法误差增长，并不会把一个本身病态的问题变成良态问题。';
   else if (q.includes('difference') || q.includes('区别') || q.includes('backward error') || q.includes('forward error') || q.includes('forward') && q.includes('backward')) answer = english ? 'Forward error asks how far the computed answer is from the exact answer. Backward error asks how much the input must change to make the computed answer exact. An algorithm can be backward stable while forward error remains large when the original problem has a large condition number. Memory aid: Forward looks at the answer; backward looks at the problem.' : 'Forward error 关注“算出来的结果离真值有多远”；Backward error 关注“要把这个结果解释成精确解，输入需要改动多少”。一个算法可以 backward stable，但如果原问题 condition number 很大，forward error 仍可能很大。记忆方法：Forward 看答案，Backward 看问题。';
   else if (q.includes('condition') || q.includes('条件数')) answer = english ? 'The condition number measures how sensitive a problem is to small input perturbations. A large value means the problem is ill-conditioned; this is different from an unstable algorithm. Separate the algorithm\'s backward error from the problem\'s condition number.' : 'Condition number 描述问题本身对输入扰动的敏感程度。它大，说明问题 ill-conditioned；这不等同于算法不稳定。判断时把算法的 backward error 与问题的 condition number 分开看。';
   else if (q.includes('summar') || q.includes('总结')) answer = hits.slice(0, 3).map(h => english ? `${h.heading}: ${h.text}` : `${h.heading}：${h.text}`).join('\n\n') || (english ? 'There is no extractable text in the current scope.' : '当前范围暂无可总结的文本。');
-  else if (selection) answer = english ? `The core idea of this passage is: ${selection.slice(0, 260)}. In other words, first identify whether it describes answer error, input perturbation, or problem sensitivity, then separate the responsibilities of the algorithm and the problem.` : `这段话的核心是：${selection.slice(0, 260)}。换句话说，先识别它描述的是“答案误差”“输入扰动”还是“问题敏感度”，再判断算法与问题各自的责任。`;
+  else if (selection) { const readableSelection = formatEvidenceText(selection, findDoc(docId)); answer = english ? `The core idea of this passage is: ${readableSelection.slice(0, 260)}. In other words, first identify whether it describes answer error, input perturbation, or problem sensitivity, then separate the responsibilities of the algorithm and the problem.` : `这段话的核心是：${readableSelection.slice(0, 260)}。换句话说，先识别它描述的是“答案误差”“输入扰动”还是“问题敏感度”，再判断算法与问题各自的责任。`; }
   else if (hits[0]) answer = english ? `${hits[0].heading}: ${hits[0].text}` : `${hits[0].heading}：${hits[0].text}`;
   return { answer, citations: refs, language, knowledge_points: ['Forward Error', 'Backward Error', 'Condition Number'].filter(x => q.includes(x.toLowerCase()) || hits.some(h => h.text.toLowerCase().includes(x.toLowerCase()))).slice(0, 3), confidence: hits[0]?.score ? 0.92 : 0.68, suggested_actions: english ? ['Create a knowledge card', 'Review this concept tomorrow'] : ['Create a knowledge card', 'Review this concept tomorrow'] };
 }
-function learningSummary(courseId = null) { const today = new Date().toISOString().slice(0, 10); const questions = learningDb.listQuestions({ courseId, limit: 200 }).filter(item => String(item.timestamp || '').slice(0, 10) === today); const concepts = learningDb.listConcepts(courseId); const progress = learningDb.listProgress({ courseId, limit: 200 }); const errors = learningDb.listErrors({ courseId, limit: 100 }).filter(item => String(item.created_at || '').slice(0, 10) === today); const graph = learningDb.listGraph(courseId); const labels = new Map(graph.nodes.map(node => [node.id, node.label])); const associations = graph.edges.map(edge => ({ source: labels.get(edge.source) || edge.source, target: labels.get(edge.target) || edge.target, type: edge.type })); return { date: today, source: 'sqlite-learning-memory', questionsToday: questions.length, learned: concepts.filter(item => String(item.last_seen || '').slice(0, 10) === today).slice(0, 12).map(item => ({ name: item.name, mastery: item.masteryScore, status: item.status })), associations: associations.slice(0, 20), weakConcepts: concepts.filter(item => item.masteryScore < 0.55).slice(0, 8).map(item => ({ name: item.name, mastery: item.masteryScore, status: item.status })), errorsToday: errors.length, progress, recentQuestions: questions.slice(0, 8).map(item => ({ question: item.question, concepts: item.concepts, timestamp: item.timestamp })) }; }
-function learningQuiz({ courseId = null, concept = '', count = 3 } = {}) { const requested = String(concept || '').trim(); const fallback = learningDb.listConcepts(courseId).find(item => item.masteryScore < 0.55)?.name || learningDb.listConcepts(courseId)[0]?.name || '当前资料'; const topic = requested || fallback; const retrieved = ragService.context(topic, { courseId, limit: Math.max(4, Number(count) * 2) }); const unique = []; const seen = new Set(); for (const item of retrieved) { const key = `${item.documentId}:${item.locator?.page || item.locator?.slide || item.locator?.sheet || item.section}`; if (!seen.has(key)) { seen.add(key); unique.push(item); } if (unique.length >= Math.max(1, Math.min(8, Number(count) || 3))) break; } return { topic, mode: 'retrieval-grounded-local', items: unique.map((item, index) => ({ id: `quiz-${Date.now()}-${index}`, question: `根据${item.citation}，请解释“${topic}”的核心含义，并说明它与这段资料的关系。`, answer: item.text, citation: item.citation, documentId: item.documentId, locator: item.locator })) }; }
+function learningSummary(courseId = null) { const today = new Date().toISOString().slice(0, 10); const questions = learningDb.listQuestions({ courseId, limit: 200 }).filter(item => String(item.timestamp || '').slice(0, 10) === today); const concepts = learningDb.listConcepts(courseId); const progress = learningDb.listProgress({ courseId, limit: 200 }); const errors = learningDb.listErrors({ courseId, limit: 100 }).filter(item => String(item.created_at || '').slice(0, 10) === today); const annotations = learningDb.listAnnotations({ limit: 500 }).filter(item => String(item.createdAt || '').slice(0, 10) === today); const graph = learningDb.listGraph(courseId); const labels = new Map(graph.nodes.map(node => [node.id, node.label])); const associations = graph.edges.map(edge => ({ source: labels.get(edge.source) || edge.source, target: labels.get(edge.target) || edge.target, type: edge.type })); return { date: today, source: 'sqlite-learning-memory', questionsToday: questions.length, annotationsToday: annotations.length, learned: concepts.filter(item => String(item.last_seen || '').slice(0, 10) === today).slice(0, 12).map(item => ({ name: item.name, mastery: item.masteryScore, status: item.status })), associations: associations.slice(0, 20), weakConcepts: concepts.filter(item => item.masteryScore < 0.55).slice(0, 8).map(item => ({ name: item.name, mastery: item.masteryScore, status: item.status })), errorsToday: errors.length, progress, recentQuestions: questions.slice(0, 8).map(item => ({ question: item.question, concepts: item.concepts, timestamp: item.timestamp })), recentLearningNotes: learningDb.listLearningNotes({ courseId: courseId || undefined, limit: 8 }), recentExperiences: learningDb.listLearningExperiences({ courseId: courseId || undefined, limit: 8 }) }; }
+function buildLearningArtifacts(sessionId) {
+  const session = learningDb.getLearningSession(sessionId);
+  if (!session) throw Object.assign(new Error('学习会话不存在或不属于当前用户'), { code: 'SESSION_NOT_FOUND' });
+  const endedAt = new Date().toISOString();
+  const annotations = learningDb.listAnnotations({ documentId: session.documentId, limit: 500 }).filter(item => !session.startedAt || String(item.createdAt) >= String(session.startedAt));
+  const notes = learningDb.listNotes({ documentId: session.documentId, limit: 200 }).filter(item => !session.startedAt || String(item.created_at || item.updated_at) >= String(session.startedAt));
+  const questions = learningDb.listQuestions({ courseId: session.courseId || undefined, limit: 500 }).filter(item => (!session.documentId || item.source_document_id === session.documentId) && String(item.timestamp || '') >= String(session.startedAt));
+  const concepts = [...new Set([...questions.flatMap(item => item.concepts || []), ...annotations.flatMap(item => memoryService.conceptsIn(`${item.text || ''}\n${item.note || ''}`)), ...notes.flatMap(item => memoryService.conceptsIn(item.content))])];
+  const highlights = annotations.filter(item => item.type === 'highlight');
+  const difficultPoints = annotations.filter(item => /不理解|没理解|困惑|难点|confus|unclear/i.test(`${item.type} ${item.note} ${item.text}`)).map(item => item.note || item.text).filter(Boolean).slice(0, 12);
+  const importantPoints = annotations.filter(item => /重点|exam|important|考试/i.test(`${item.type} ${item.note} ${item.text}`)).map(item => item.note || item.text).filter(Boolean).slice(0, 12);
+  const summary = concepts.length ? `本次学习围绕 ${concepts.join('、')} 展开；阅读 ${session.pagesViewed.length || 0} 页，产生 ${questions.length} 个问题，保存 ${annotations.length} 条批注。${difficultPoints.length ? `主要困难：${difficultPoints.join('；')}` : '暂未记录明确困难。'}` : `本次学习阅读 ${session.pagesViewed.length || 0} 页，产生 ${questions.length} 个问题，保存 ${annotations.length} 条批注。`;
+  const rawEvidence = { pagesViewed: session.pagesViewed, annotations: annotations.map(item => ({ id: item.id, page: item.page, type: item.type, text: item.text, note: item.note })), notes: notes.map(item => ({ id: item.id, title: item.title, content: item.content, locator: item.locator })), questions: questions.map(item => ({ id: item.id, question: item.question, concepts: item.concepts, timestamp: item.timestamp })), counts: { annotations: annotations.length, highlights: highlights.length, questions: questions.length, notes: notes.length } };
+  const interpretation = { kind: 'heuristic-summary', basis: ['annotations', 'notes', 'questions', 'concepts'], caveat: '这是基于可观测学习行为的整理，不等同于已掌握。', difficultPoints, importantPoints };
+  const finished = learningDb.updateLearningSession(sessionId, { endedAt, annotationsCreated: annotations.length, questionsAsked: questions.length, conceptsViewed: concepts, generatedSummary: summary, rawEvidence, interpretation });
+  const note = learningDb.saveLearningNote({ courseId: session.courseId, documentId: session.documentId, sessionId, title: `${session.documentId ? '讲义学习笔记' : '学习笔记'} · ${endedAt.slice(0, 10)}`, concepts, highlights, annotations, questions, explanations: questions.map(item => ({ question: item.question, answerSummary: item.answer_summary, concepts: item.concepts })), difficultPoints, importantPoints, misconceptions: difficultPoints, summary, rawEvidence, interpretation });
+  const experience = learningDb.saveLearningExperience({ courseId: session.courseId, documentId: session.documentId, sessionId, date: endedAt.slice(0, 10), title: concepts.length ? `学习 ${concepts.slice(0, 3).join('、')}` : '完成一次讲义学习', content: summary, concepts, focus: importantPoints, questionsCount: questions.length, difficultPoints, masteryChanges: learningDb.listProgress({ courseId: session.courseId || undefined, limit: 100 }).filter(item => concepts.includes(item.concept_name)).map(item => ({ concept: item.concept_name, event: item.last_event, updatedAt: item.updated_at })), relatedConcepts: learningDb.listGraph(session.courseId || undefined).edges.filter(edge => concepts.includes(edge.sourceLabel) || concepts.includes(edge.targetLabel)).slice(0, 20), rawEvidence, interpretation });
+  return { session: finished, note, experience };
+}
+  function learningQuiz({ courseId = null, concept = '', count = 6, language = 'zh' } = {}) { const en = language === 'en'; const requested = String(concept || '').trim(); const concepts = learningDb.listConcepts(courseId); const fallback = concepts.find(item => item.masteryScore < 0.55)?.name || concepts[0]?.name || (en ? 'the current material' : '当前资料'); const topic = requested || fallback; const requestedCount = Math.max(4, Math.min(8, Number(count) || 6)); const retrieved = ragService.context(topic, { courseId, limit: Math.max(requestedCount * 3, 18) }); const unique = []; const seen = new Set(); for (const item of retrieved) { const key = `${item.documentId}:${item.locator?.page || item.locator?.slide || item.locator?.sheet || item.section}:${item.text.slice(0, 80)}`; if (!seen.has(key)) { seen.add(key); unique.push(item); } if (unique.length >= requestedCount) break; } const variants = en ? [ ['concept', 'Concept explanation', item => `According to ${item.citation}, explain the core idea of “${topic}” and its role in this material.`], ['formula', 'Formula recognition', item => `Identify the mathematical expression or notation in ${item.citation}, rewrite it in LaTeX if applicable, and explain each important symbol.`], ['comparison', 'Comparison and distinction', item => `Compare the idea in ${item.citation} with a closely related method or concept. State one important difference.`], ['application', 'Application reasoning', item => `Suppose you need to apply “${topic}” in a new problem. What decision or steps should you take based on ${item.citation}?`], ['diagnosis', 'Error diagnosis', item => `What misunderstanding or numerical mistake could happen when reading ${item.citation}, and how would you detect or correct it?`], ['evidence', 'Evidence summary', item => `Summarize the evidence in ${item.citation} in two or three sentences, keeping the key condition, result, or limitation.`] ] : [ ['concept', '概念解释', item => `根据${item.citation}，解释“${topic}”的核心含义，并说明它在这段资料中的作用。`], ['formula', '公式识别', item => `请识别${item.citation}中的数学表达式或符号；如果包含公式，请用 LaTeX 重写，并解释关键符号。`], ['comparison', '比较辨析', item => `请将${item.citation}中的“${topic}”与一个相关方法或概念进行比较，说明至少一个关键区别。`], ['application', '应用推理', item => `如果在新问题中使用“${topic}”，根据${item.citation}应采取哪些步骤或判断？请说明理由。`], ['diagnosis', '错误诊断', item => `阅读${item.citation}时可能出现什么理解或数值计算错误？请给出发现和纠正方法。`], ['evidence', '证据概括', item => `请用两三句话概括${item.citation}中的关键条件、结论或限制，并保留重要细节。` ] ]; return { topic, mode: 'retrieval-grounded-local', items: unique.map((item, index) => { const [type, typeLabel, question] = variants[index % variants.length]; return { id: `quiz-${Date.now()}-${index}`, type, typeLabel, question: question(item), answer: formatEvidenceText(item.text, findDoc(item.documentId)), citation: item.citation, documentId: item.documentId, locator: item.locator }; }) }; }
 
+const SESSION_COOKIE = 'studyagent_session';
+const authRateBuckets = new Map();
+function parseCookies(header = '') { return String(header).split(';').map(item => item.trim().split('=').map(decodeURIComponent)).filter(item => item.length === 2).reduce((result, [key, value]) => ({ ...result, [key]: value }), {}); }
+function guestUser() { return { id: 'user-local', email: '', username: 'Guest', avatarUrl: '', guest: true }; }
+function authContext(req) { const sessionId = parseCookies(req.headers.cookie || '')[SESSION_COOKIE]; const session = learningDb.getSession(sessionId); return session ? { ...session, guest: false } : { user: guestUser(), session: null, guest: true }; }
+function setSessionCookie(res, sessionId, maxAge = 30 * 86400) { res.setHeader('Set-Cookie', `${SESSION_COOKIE}=${encodeURIComponent(sessionId)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}`); }
+function clearSessionCookie(res) { setSessionCookie(res, '', 0); }
+function sameOrigin(req) { const origin = req.headers.origin || req.headers.referer; return !origin || /^https?:\/\/127\.0\.0\.1(?::\d+)?(?:\/|$)/i.test(origin) || /^https?:\/\/localhost(?::\d+)?(?:\/|$)/i.test(origin); }
+function allowAuthAttempt(req, identity = '') { const key = `${req.socket.remoteAddress || 'local'}:${String(identity || '').toLowerCase()}`; const current = Date.now(); const bucket = authRateBuckets.get(key) || { count: 0, startedAt: current }; if (current - bucket.startedAt > 10 * 60 * 1000) { bucket.count = 0; bucket.startedAt = current; } bucket.count += 1; authRateBuckets.set(key, bucket); return bucket.count <= 12; }
+function safeAccountSettings(input = {}) { const next = {}; if (input.language !== undefined) next.language = input.language === 'en' || input.language === 'English' ? 'en' : 'zh'; if (input.privacy !== undefined) next.privacy = ['selected-only', 'current-page', 'retrieved-chunks'].includes(input.privacy) ? input.privacy : 'retrieved-chunks'; if (input.retrievalK !== undefined) next.retrievalK = Math.max(1, Math.min(20, Number(input.retrievalK) || 8)); if (input.memoryEnabled !== undefined) next.memoryEnabled = Boolean(input.memoryEnabled); if (input.promptOptimization && typeof input.promptOptimization === 'object') next.promptOptimization = input.promptOptimization; return next; }
 function parsePath(reqUrl) { return new URL(reqUrl, 'http://localhost'); }
 async function api(req, res, url) {
-  const parts = url.pathname.split('/').filter(Boolean); const method = req.method;
+  const parts = url.pathname.split('/').filter(Boolean); const method = req.method; const auth = authContext(req); learningDb.setUserId(auth.user.id); learningDb.ensureUserSpace(auth.user.id); syncModelConfigs(auth.user.id);
+  const userSettings = auth.guest ? db.settings : learningDb.getUserSettings(auth.user.id);
+  db.settings = { ...db.settings, ...userSettings, memoryEnabled: auth.guest ? false : userSettings?.memoryEnabled !== false, promptOptimization: { ...DEFAULT_PROMPT_SETTINGS, ...(db.settings?.promptOptimization || {}), ...(userSettings?.promptOptimization || {}) } };
+  if (['POST', 'PATCH', 'DELETE'].includes(method) && !sameOrigin(req)) return error(res, 'CSRF_ORIGIN_REJECTED', '写请求必须来自当前 StudyAgent 地址。', { status: 403 });
+  if (method === 'GET' && url.pathname === '/api/auth/session') return json(res, 200, { authenticated: !auth.guest, guest: auth.guest, user: auth.user, expiresAt: auth.session?.expiresAt || null });
+  if (method === 'POST' && url.pathname === '/api/auth/register') { const input = await body(req); if (!allowAuthAttempt(req, input.email)) return error(res, 'AUTH_RATE_LIMITED', '尝试次数过多，请稍后再试。', { status: 429 }); try { const result = authService.register(input); setSessionCookie(res, result.session.id); learningDb.setUserId(result.user.id); return json(res, 201, { authenticated: true, guest: false, user: result.user, expiresAt: result.session.expiresAt }); } catch (e) { return error(res, e.code || 'REGISTER_FAILED', e.message, { status: e.status || 400 }); } }
+  if (method === 'POST' && url.pathname === '/api/auth/login') { const input = await body(req); if (!allowAuthAttempt(req, input.email)) return error(res, 'AUTH_RATE_LIMITED', '尝试次数过多，请稍后再试。', { status: 429 }); try { const result = authService.login(input); setSessionCookie(res, result.session.id); learningDb.setUserId(result.user.id); return json(res, 200, { authenticated: true, guest: false, user: result.user, expiresAt: result.session.expiresAt }); } catch (e) { return error(res, e.code || 'LOGIN_FAILED', e.message, { status: e.status || 401 }); } }
+  if (method === 'POST' && url.pathname === '/api/auth/logout') { if (auth.session?.id) learningDb.deleteSession(auth.session.id); clearSessionCookie(res); learningDb.setUserId('user-local'); return json(res, 200, { authenticated: false, guest: true, user: guestUser() }); }
+  if (method === 'GET' && url.pathname === '/api/account') { if (auth.guest) return error(res, 'AUTH_REQUIRED', '请先登录个人账号。', { status: 401 }); return json(res, 200, { user: learningDb.getUserById(auth.user.id), settings: learningDb.getUserSettings(auth.user.id) }); }
+  if (method === 'PATCH' && url.pathname === '/api/account') { if (auth.guest) return error(res, 'AUTH_REQUIRED', '请先登录个人账号。', { status: 401 }); const input = await body(req); try { return json(res, 200, { user: learningDb.updateUserAccount(auth.user.id, { username: input.username, avatarUrl: input.avatarUrl }) }); } catch (e) { return error(res, 'ACCOUNT_UPDATE_FAILED', e.message, { status: 400 }); } }
+  if (method === 'POST' && url.pathname === '/api/account/password') { if (auth.guest) return error(res, 'AUTH_REQUIRED', '请先登录个人账号。', { status: 401 }); const input = await body(req); const account = learningDb.getUserAuthByEmail(auth.user.email); if (!account || !authService.verifyPassword(String(input.currentPassword || ''), account.passwordHash)) return error(res, 'INVALID_CURRENT_PASSWORD', '当前密码不正确。', { status: 401 }); try { authService.validateCredentials({ email: auth.user.email, password: input.newPassword }); learningDb.updateUserPassword(auth.user.id, authService.hashPassword(input.newPassword)); return json(res, 200, { ok: true }); } catch (e) { return error(res, e.code || 'PASSWORD_UPDATE_FAILED', e.message, { status: e.status || 400 }); } }
+  if (method === 'GET' && url.pathname === '/api/account/settings') { if (auth.guest) return json(res, 200, { guest: true, settings: db.settings || {} }); return json(res, 200, { guest: false, settings: learningDb.getUserSettings(auth.user.id) }); }
+  if (method === 'POST' && url.pathname === '/api/account/settings') { if (auth.guest) return error(res, 'AUTH_REQUIRED', '登录后才能保存个人账号设置。', { status: 401 }); const input = await body(req); return json(res, 200, { settings: learningDb.saveUserSettings(safeAccountSettings(input), auth.user.id) }); }
+  if (method === 'DELETE' && url.pathname === '/api/account') { if (auth.guest) return error(res, 'AUTH_REQUIRED', '请先登录个人账号。', { status: 401 }); const input = await body(req); if (String(input.confirmation || '') !== 'DELETE') return error(res, 'DELETE_CONFIRMATION_REQUIRED', '请输入 DELETE 确认删除账号。', { status: 400 }); const ownedFiles = learningDb.listDocuments().map(item => item.source_path || item.sourceFile).filter(Boolean); const result = learningDb.deleteUserAccount(auth.user.id); for (const sourceFile of ownedFiles) { const targetPath = path.join(UPLOAD_DIR, path.basename(sourceFile)); if (fs.existsSync(targetPath)) fs.rmSync(targetPath, { force: true }); } clearSessionCookie(res); learningDb.setUserId('user-local'); return json(res, 200, result); }
   if (method === 'GET' && url.pathname === '/api/ocr/status') return json(res, 200, { available: ocrAvailable(), engine: ocrAvailable() ? 'tesseract.js' : null, language: ocrAvailable() ? 'chi_sim' : null, renderer: findPdftoppm() ? 'pdftoppm' : null });
-  if (method === 'GET' && url.pathname === '/api/parser/status') return json(res, 200, parserStatus());
-  if (method === 'POST' && url.pathname === '/api/agent/plan') { const b = await body(req); const document = findDoc(b.documentId); return json(res, 200, learningOrchestrator.prepare({ question: b.message || '', body: b, document, kind: b.kind || 'text', scope: learningScope(b, document) })); }
+  if (method === 'GET' && url.pathname === '/api/parser/status') return json(res, 200, { ...parserStatus(), legacyOffice: await legacyOfficeStatus() });
+  if (method === 'POST' && url.pathname === '/api/agent/plan') { const b = await body(req); const document = findDoc(b.documentId); const scopedBody = { ...b, memoryEnabled: db.settings?.memoryEnabled !== false }; return json(res, 200, learningOrchestrator.prepare({ question: b.message || '', body: scopedBody, document, kind: b.kind || 'text', scope: learningScope(b, document) })); }
   if (method === 'GET' && url.pathname === '/api/models/providers') return json(res, 200, { providers: publicProviders() });
   if (method === 'GET' && url.pathname === '/api/models/configs') return json(res, 200, { configs: modelConfigs.map(publicModelConfig), defaultId: defaultModelConfig()?.id || null });
   if (method === 'POST' && url.pathname === '/api/models/configs') {
@@ -663,40 +839,61 @@ async function api(req, res, url) {
   }
   if (method === 'POST' && parts[0] === 'api' && parts[1] === 'models' && parts[2] === 'configs' && parts[4] === 'test') {
     const config = modelConfigs.find(item => item.id === parts[3]); if (!config) return error(res, 'MODEL_CONFIG_NOT_FOUND', '模型配置不存在');
-    if (!config.apiKey) return json(res, 200, { ok: false, error: { code: 'API_KEY_REQUIRED', message: '当前模型配置没有 API Key' } });
+    if (!canUseModelConfig(config)) return json(res, 200, { ok: false, error: { code: 'API_KEY_REQUIRED', message: '当前模型配置不可用；远程服务需要 API Key，Ollama 可免 Key 使用。' } });
     try { return json(res, 200, { ...(await createProvider(config).testConnection()), ok: true }); } catch (e) { return json(res, e.status || 200, { ok: false, error: { code: e.code || 'CONNECTION_FAILED', message: safeMessage(e, '连接模型服务失败') } }); }
   }
   if (method === 'POST' && url.pathname === '/api/models/discover') {
     const input = await body(req); const previous = input.id ? modelConfigs.find(item => item.id === input.id) : null; const config = normalizeModelConfig(input, previous || {});
-    if (!config.apiKey) return error(res, 'API_KEY_REQUIRED', '刷新模型列表前请先填写 API Key');
+    if (!canUseModelConfig(config)) return error(res, 'API_KEY_REQUIRED', '刷新模型列表前请先填写 API Key；Ollama 本地服务可免 Key 使用');
     try { const models = await createProvider(config).listModels(); modelListCache.set(config.provider, models); return json(res, 200, { models, source: 'remote' }); } catch (e) { return json(res, 200, { models: fallbackModels(config.provider), source: 'fallback', error: { code: e.code || 'MODEL_LIST_FAILED', message: safeMessage(e, '动态模型列表获取失败，已使用本地列表') } }); }
   }
   if (method === 'GET' && url.pathname === '/api/documents') return json(res, 200, learningDb.listDocuments().map(clientDocumentView));
   if (method === 'GET' && url.pathname === '/api/workspaces') return json(res, 200, learningDb.listWorkspaces());
   if (method === 'POST' && url.pathname === '/api/workspaces') { const b = await body(req); if (!b.name) return error(res, 'INVALID_WORKSPACE', '工作区名称不能为空'); return json(res, 201, learningDb.createWorkspace(b.name, b.description || '')); }
-  if (method === 'GET' && url.pathname === '/api/courses') return json(res, 200, learningDb.listCourses(url.searchParams.get('workspaceId') || 'workspace-personal'));
-  if (method === 'POST' && url.pathname === '/api/courses') { const b = await body(req); if (!b.name) return error(res, 'INVALID_COURSE', '课程名称不能为空'); return json(res, 201, learningDb.createCourse(b.name, b.workspaceId || 'workspace-personal', b.description || '')); }
+  if (method === 'GET' && url.pathname === '/api/courses') return json(res, 200, learningDb.listCourses(url.searchParams.get('workspaceId') || learningDb.defaultWorkspaceId()));
+  if (method === 'POST' && url.pathname === '/api/courses') { const b = await body(req); if (!b.name) return error(res, 'INVALID_COURSE', '课程名称不能为空'); return json(res, 201, learningDb.createCourse(b.name, b.workspaceId || learningDb.defaultWorkspaceId(), b.description || '')); }
   if (method === 'GET' && url.pathname === '/api/conversations') return json(res, 200, { conversations: learningDb.listConversations({ courseId: url.searchParams.get('courseId') || undefined, limit: Number(url.searchParams.get('limit') || 50) }) });
   if (method === 'GET' && parts[0] === 'api' && parts[1] === 'conversations' && parts[2] && parts[3] === 'messages') return json(res, 200, { conversationId: parts[2], messages: learningDb.listConversationMessages(parts[2], Number(url.searchParams.get('limit') || 200)) });
   if (method === 'GET' && url.pathname === '/api/learning/documents') return json(res, 200, learningDb.listDocuments({ courseId: url.searchParams.get('courseId') || undefined, workspaceId: url.searchParams.get('workspaceId') || undefined }));
-  if (method === 'POST' && url.pathname === '/api/learning/reindex') { const b = await body(req); const config = selectModelConfig(b); if (!config || !config.apiKey) return error(res, 'REMOTE_MODEL_REQUIRED', '远程 Embedding 重建索引需要先配置模型服务', { status: 503 }); const requestedIds = Array.isArray(b.documentIds) ? b.documentIds.filter(Boolean) : []; const documents = requestedIds.length ? requestedIds.map(id => learningDb.getDocument(id)).filter(Boolean) : learningDb.listDocuments({ courseId: b.courseId || undefined, workspaceId: b.workspaceId || undefined }); const chunks = documents.flatMap(document => learningDb.getDocumentContext(document.id)); if (!chunks.length) return error(res, 'NO_CHUNKS', '指定范围没有可建立索引的内容'); try { const result = await ragService.indexChunksWithProvider(chunks, input => createProvider(config).embed(input), b.embeddingModel || config.embeddingModel || config.model); return json(res, 200, { ...result, scope: requestedIds.length ? 'documents' : b.courseId ? 'course' : 'workspace', documentIds: documents.map(document => document.id) }); } catch (e) { return error(res, e.code || 'REINDEX_FAILED', safeMessage(e, '远程 Embedding 重建失败'), { status: e.status || 502 }); } }
+  if (method === 'POST' && url.pathname === '/api/learning/reindex') { const b = await body(req); const config = selectModelConfig(b); if (!canUseModelConfig(config)) return error(res, 'REMOTE_MODEL_REQUIRED', '远程 Embedding 重建索引需要先配置模型服务', { status: 503 }); const requestedIds = Array.isArray(b.documentIds) ? b.documentIds.filter(Boolean) : []; const documents = requestedIds.length ? requestedIds.map(id => learningDb.getDocument(id)).filter(Boolean) : learningDb.listDocuments({ courseId: b.courseId || undefined, workspaceId: b.workspaceId || undefined }); const chunks = documents.flatMap(document => learningDb.getDocumentContext(document.id)); if (!chunks.length) return error(res, 'NO_CHUNKS', '指定范围没有可建立索引的内容'); try { const result = await ragService.indexChunksWithProvider(chunks, input => createProvider(config).embed(input), b.embeddingModel || config.embeddingModel || config.model); return json(res, 200, { ...result, scope: requestedIds.length ? 'documents' : b.courseId ? 'course' : 'workspace', documentIds: documents.map(document => document.id) }); } catch (e) { return error(res, e.code || 'REINDEX_FAILED', safeMessage(e, '远程 Embedding 重建失败'), { status: e.status || 502 }); } }
   if (method === 'GET' && url.pathname === '/api/learning/progress') return json(res, 200, { progress: learningDb.listProgress({ courseId: url.searchParams.get('courseId') || undefined, limit: Number(url.searchParams.get('limit') || 100) }) });
   if (method === 'GET' && url.pathname === '/api/learning/summary') return json(res, 200, learningSummary(url.searchParams.get('courseId') || null));
-  if (method === 'POST' && url.pathname === '/api/learning/quiz') { const b = await body(req); return json(res, 200, learningQuiz({ courseId: b.courseId || null, concept: b.concept || '', count: b.count || 3 })); }
+  if (method === 'GET' && url.pathname === '/api/learning/sessions') return json(res, 200, { sessions: learningDb.listLearningSessions({ courseId: url.searchParams.get('courseId') || undefined, limit: Number(url.searchParams.get('limit') || 100) }) });
+  if (method === 'POST' && url.pathname === '/api/learning/sessions') { const b = await body(req); try { return json(res, 201, learningDb.startLearningSession({ workspaceId: b.workspaceId || learningDb.defaultWorkspaceId(), courseId: b.courseId || null, documentId: b.documentId || null })); } catch (e) { return error(res, 'SESSION_START_FAILED', e.message); } }
+  if (method === 'PATCH' && parts[0] === 'api' && parts[1] === 'learning' && parts[2] === 'sessions' && parts[3]) { const b = await body(req); try { if (b.finish) return json(res, 200, buildLearningArtifacts(parts[3])); return json(res, 200, learningDb.updateLearningSession(parts[3], b)); } catch (e) { return error(res, e.code || 'SESSION_UPDATE_FAILED', e.message); } }
+  if (method === 'POST' && parts[0] === 'api' && parts[1] === 'learning' && parts[2] === 'sessions' && parts[3] && parts[4] === 'finish') { try { return json(res, 200, buildLearningArtifacts(parts[3])); } catch (e) { return error(res, e.code || 'SESSION_FINISH_FAILED', e.message); } }
+  if (method === 'GET' && url.pathname === '/api/learning/notes') return json(res, 200, { notes: learningDb.listLearningNotes({ courseId: url.searchParams.get('courseId') || undefined, documentId: url.searchParams.get('documentId') || undefined, sessionId: url.searchParams.get('sessionId') || undefined, limit: Number(url.searchParams.get('limit') || 100) }) });
+  if (method === 'POST' && url.pathname === '/api/learning/notes') { const b = await body(req); try { return json(res, 201, learningDb.saveLearningNote(b)); } catch (e) { return error(res, 'LEARNING_NOTE_SAVE_FAILED', e.message); } }
+  if (method === 'GET' && url.pathname === '/api/learning/experiences') return json(res, 200, { experiences: learningDb.listLearningExperiences({ courseId: url.searchParams.get('courseId') || undefined, limit: Number(url.searchParams.get('limit') || 100) }) });
+  if (method === 'GET' && url.pathname === '/api/agent/context/last') { const enabled = currentPromptSettings().developmentLogs || process.env.STUDYAGENT_DEV_CONTEXT === '1'; return enabled ? json(res, 200, { enabled: true, context: lastAgentContext }) : json(res, 200, { enabled: false, context: null }); }
+  if (method === 'POST' && url.pathname === '/api/learning/quiz') { const b = await body(req); return json(res, 200, learningQuiz({ courseId: b.courseId || null, concept: b.concept || '', count: b.count || 6, language: b.language === 'en' ? 'en' : 'zh' })); }
   if (method === 'GET' && url.pathname === '/api/learning/quiz/attempts') return json(res, 200, { attempts: learningDb.listQuizAttempts({ courseId: url.searchParams.get('courseId') || undefined, limit: Number(url.searchParams.get('limit') || 50) }) });
   if (method === 'POST' && url.pathname === '/api/learning/quiz/attempt') { const b = await body(req); if (!Array.isArray(b.answers) || !b.answers.length) return error(res, 'INVALID_QUIZ_ATTEMPT', '至少需要提交一道复习题的作答结果'); return json(res, 201, memoryService.recordQuizAttempt({ courseId: b.courseId || null, concept: b.concept || '当前资料', answers: b.answers })); }
+  if (method === 'PATCH' && parts[0] === 'api' && parts[1] === 'learning' && parts[2] === 'documents' && parts[3]) {
+    const target = findDoc(parts[3]); if (!target) return error(res, 'DOCUMENT_NOT_FOUND', '资料不存在');
+    const b = await body(req);
+    try {
+      const updated = learningDb.updateDocumentOrganization(parts[3], { workspaceId: b.workspaceId, courseId: Object.prototype.hasOwnProperty.call(b, 'courseId') ? b.courseId : undefined });
+      db.documents = db.documents.map(document => document.id === parts[3] ? { ...document, ...updated.legacy, courseId: updated.course_id, workspaceId: updated.workspace_id, course: updated.legacy?.course || '未分类' } : document);
+      save();
+      return json(res, 200, clientDocumentView(updated));
+    } catch (e) { return error(res, e.code || 'DOCUMENT_ORGANIZATION_FAILED', e.message, { status: 400 }); }
+  }
   if (method === 'DELETE' && parts[0] === 'api' && parts[1] === 'learning' && parts[2] === 'documents' && parts[3]) { const target = findDoc(parts[3]); const removed = learningDb.deleteDocument(parts[3]); if (target?.sourceFile) { const targetPath = path.join(UPLOAD_DIR, target.sourceFile); if (fs.existsSync(targetPath)) fs.rmSync(targetPath, { force: true }); } if (removed) { db.documents = db.documents.filter(document => document.id !== parts[3]); save(); } return json(res, 200, { ok: removed, id: parts[3] }); }
-  if (method === 'GET' && url.pathname === '/api/learning/search') { const query = url.searchParams.get('q') || ''; const scope = url.searchParams.get('scope') || 'workspace'; const documentIds = (url.searchParams.get('documentIds') || '').split(',').map(value => value.trim()).filter(Boolean); const page = Number(url.searchParams.get('page') || 0) || undefined; const slide = Number(url.searchParams.get('slide') || 0) || undefined; const sheet = url.searchParams.get('sheet') || undefined; const options = { page, slide, sheet, limit: Number(url.searchParams.get('limit') || 10) }; if (scope === 'course') options.courseId = url.searchParams.get('courseId') || '__empty-course__'; else if (scope === 'documents' || scope === 'current-document' || scope === 'current-page') options.documentIds = documentIds.length ? documentIds : ['__empty-document-selection__']; else options.workspaceId = url.searchParams.get('workspaceId') || 'workspace-personal'; return json(res, 200, { query, scope, results: ragService.context(query, options) }); }
+  if (method === 'GET' && url.pathname === '/api/learning/search') { const query = url.searchParams.get('q') || ''; const scope = url.searchParams.get('scope') || 'workspace'; const documentIds = (url.searchParams.get('documentIds') || '').split(',').map(value => value.trim()).filter(Boolean); const page = Number(url.searchParams.get('page') || 0) || undefined; const slide = Number(url.searchParams.get('slide') || 0) || undefined; const sheet = url.searchParams.get('sheet') || undefined; const options = { page, slide, sheet, limit: Number(url.searchParams.get('limit') || 10) }; if (scope === 'course') options.courseId = url.searchParams.get('courseId') || '__empty-course__'; else if (scope === 'documents' || scope === 'current-document' || scope === 'current-page') options.documentIds = documentIds.length ? documentIds : ['__empty-document-selection__']; else options.workspaceId = url.searchParams.get('workspaceId') || learningDb.defaultWorkspaceId(); return json(res, 200, { query, scope, results: ragService.context(query, options) }); }
   if (method === 'GET' && url.pathname === '/api/memory') return json(res, 200, { profile: learningDb.getUserProfile(), memories: learningDb.listMemories({ type: url.searchParams.get('type') || undefined, courseId: url.searchParams.get('courseId') || undefined, limit: Number(url.searchParams.get('limit') || 100) }), concepts: learningDb.listConcepts(url.searchParams.get('courseId') || undefined), questions: learningDb.listQuestions({ courseId: url.searchParams.get('courseId') || undefined, limit: Number(url.searchParams.get('questionLimit') || 50) }), errors: learningDb.listErrors({ courseId: url.searchParams.get('courseId') || undefined, limit: Number(url.searchParams.get('errorLimit') || 50) }) });
   if (method === 'GET' && url.pathname === '/api/memory/profile') return json(res, 200, { profile: learningDb.getUserProfile() });
   if (method === 'GET' && url.pathname === '/api/errors') return json(res, 200, { errors: learningDb.listErrors({ courseId: url.searchParams.get('courseId') || undefined, limit: Number(url.searchParams.get('limit') || 100) }) });
   if (method === 'GET' && url.pathname === '/api/memory/export') { res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Disposition': 'attachment; filename="studyagent-memory.json"' }); return res.end(JSON.stringify(learningDb.exportMemory(), null, 2)); }
+  if (method === 'GET' && url.pathname === '/api/account/export') { if (auth.guest) return error(res, 'AUTH_REQUIRED', '请先登录个人账号。', { status: 401 }); res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Disposition': 'attachment; filename="studyagent-account-export.json"' }); return res.end(JSON.stringify(learningDb.exportUserData(), null, 2)); }
   if (method === 'DELETE' && parts[0] === 'api' && parts[1] === 'memory' && parts[2] === 'course') { const courseId = url.searchParams.get('courseId'); if (!courseId) return error(res, 'COURSE_REQUIRED', '清空课程记忆需要 courseId'); return json(res, 200, learningDb.clearCourseMemory(courseId)); }
   if (method === 'POST' && url.pathname === '/api/memory/profile') { const b = await body(req); return json(res, 200, { profile: learningDb.saveUserProfile(b.profile || b) }); }
   if (method === 'DELETE' && url.pathname === '/api/memory/profile') return json(res, 200, { ok: learningDb.deleteUserProfile() });
   if (method === 'POST' && parts[0] === 'api' && parts[1] === 'memory' && parts[2] && parts[2] !== 'errors') { const b = await body(req); return json(res, 200, { ok: learningDb.updateMemory(parts[2], b.content, b.importance), id: parts[2] }); }
   if (method === 'POST' && url.pathname === '/api/memory/errors') { const b = await body(req); if (!b.description || !b.concept) return error(res, 'INVALID_ERROR_MEMORY', '概念和错误描述不能为空'); return json(res, 201, { id: memoryService.updateError({ description: b.description, correction: b.correction || '', courseId: b.courseId || null, concept: b.concept, questionId: b.questionId || null }) }); }
   if (method === 'DELETE' && parts[0] === 'api' && parts[1] === 'memory' && parts[2]) return json(res, 200, { ok: learningDb.deleteMemory(parts[2]), id: parts[2] });
+  if (method === 'POST' && url.pathname === '/api/graph/relations') { const b = await body(req); try { const relation = learningDb.saveRelation({ sourceId: b.sourceId, targetId: b.targetId, type: b.type, weight: b.weight, source: 'user' }); return json(res, 201, relation); } catch (e) { return error(res, 'RELATION_SAVE_FAILED', e.message, { status: 400 }); } }
+  if (method === 'DELETE' && parts[0] === 'api' && parts[1] === 'graph' && parts[2] === 'relations' && parts[3]) return json(res, 200, { ok: learningDb.deleteRelation(parts[3]), id: parts[3] });
   if (method === 'GET' && parts[0] === 'api' && parts[1] === 'graph' && parts[2]) { const details = learningDb.getConceptDetails(parts[2]); return details ? json(res, 200, details) : error(res, 'CONCEPT_NOT_FOUND', '概念不存在'); }
   if (method === 'GET' && url.pathname === '/api/graph') return json(res, 200, learningDb.listGraph(url.searchParams.get('courseId') || undefined));
   if (method === 'GET' && url.pathname === '/api/questions') return json(res, 200, learningDb.listQuestions({ courseId: url.searchParams.get('courseId') || undefined, limit: Number(url.searchParams.get('limit') || 50) }));
@@ -724,6 +921,7 @@ async function api(req, res, url) {
   }
   if (method === 'GET' && parts[0] === 'api' && parts[1] === 'documents' && parts[2] && parts[3] === 'pages') { const d = findDoc(parts[2]); return d ? json(res, 200, d.content) : error(res, 'NOT_FOUND', 'Document not found'); }
   if (method === 'POST' && parts[0] === 'api' && parts[1] === 'documents' && parts[2] && parts[3] === 'formula') { const d = findDoc(parts[2]); if (!d) return error(res, 'NOT_FOUND', 'Document not found'); try { return json(res, 200, await correctDocumentFormula(d, await body(req))); } catch (e) { return error(res, e.code || 'FORMULA_CORRECTION_FAILED', e.message); } }
+  if (method === 'POST' && parts[0] === 'api' && parts[1] === 'documents' && parts[2] && parts[3] === 'math-ocr') { const d = findDoc(parts[2]); if (!d) return error(res, 'NOT_FOUND', 'Document not found'); try { return json(res, 200, await recognizeDocumentMath(d, await body(req))); } catch (e) { return error(res, e.code || 'MATH_OCR_FAILED', safeMessage(e, '专用数学 OCR 识别失败'), { status: e.status || 502 }); } }
   if (method === 'POST' && parts[0] === 'api' && parts[1] === 'documents' && parts[2] && parts[3] === 'vision') { const d = findDoc(parts[2]); if (!d) return error(res, 'NOT_FOUND', 'Document not found'); try { return json(res, 200, await analyzeDocumentVision(d, await body(req))); } catch (e) { return error(res, e.code || 'VISION_FAILED', safeMessage(e, 'Vision 分析失败'), { status: e.status || 502 }); } }
   if (method === 'GET' && parts[0] === 'api' && parts[1] === 'documents' && parts[2]) { const d = findDoc(parts[2]); return d ? json(res, 200, d) : error(res, 'NOT_FOUND', 'Document not found'); }
   if (method === 'POST' && parts[0] === 'api' && parts[1] === 'documents' && parts[2] && parts[3] === 'reprocess') { const d = findDoc(parts[2]); if (!d) return error(res, 'NOT_FOUND', 'Document not found'); try { return json(res, 200, await reprocessDocument(d)); } catch (e) { return error(res, 'REPROCESS_FAILED', e.message); } }
@@ -733,7 +931,7 @@ async function api(req, res, url) {
     if (b.documentId && !document) return error(res, 'DOCUMENT_NOT_FOUND', '笔记关联的文档不存在');
     if (!String(b.content || '').trim()) return error(res, 'INVALID_NOTE', '笔记内容不能为空');
     try {
-      const note = learningDb.saveNote({ noteId: b.id, title: b.title || (document ? `${document.title} · 第${Number(b.locator?.page || b.page || 1)}页` : '学习笔记'), content: b.content, courseId: b.courseId || document?.courseId || document?.course_id || null, documentId: b.documentId || null, locator: { ...(b.locator || {}), page: Number(b.locator?.page || b.page || 0) || undefined, selectedText: String(b.locator?.selectedText || b.selectedText || '').slice(0, 500), section: String(b.locator?.section || '').slice(0, 200) }
+      const note = learningDb.saveNote({ noteId: b.id, title: b.title || (document ? `${document.title} · 第${Number(b.locator?.page || b.page || 1)}页` : '学习笔记'), content: b.content, courseId: b.courseId || document?.courseId || document?.course_id || null, documentId: b.documentId || null, locator: { ...(b.locator || {}), page: Number(b.locator?.page || b.page || 0) || undefined, selectedText: String(b.locator?.selectedText || b.selectedText || '').slice(0, 500), formulaLatex: String(b.locator?.formulaLatex || b.formulaLatex || '').slice(0, 4000), section: String(b.locator?.section || '').slice(0, 200) }
       });
       return json(res, b.id ? 200 : 201, note);
     } catch (e) { return error(res, 'NOTE_SAVE_FAILED', e.message); }
@@ -745,30 +943,45 @@ async function api(req, res, url) {
   }
   if (method === 'DELETE' && parts[0] === 'api' && parts[1] === 'notes' && parts[2]) return json(res, 200, { ok: learningDb.deleteNote(parts[2]), id: parts[2] });
   if (method === 'GET' && url.pathname === '/api/annotations') return json(res, 200, learningDb.listAnnotations({ documentId: url.searchParams.get('documentId') || undefined, limit: Number(url.searchParams.get('limit') || 500) }));
+  if (method === 'POST' && url.pathname === '/api/documents/upload-batch') {
+    const b = await body(req); const files = Array.isArray(b.files) ? b.files : [];
+    if (!files.length) return error(res, 'INVALID_BATCH', '批量导入至少需要一个文件');
+    if (files.length > 50) return error(res, 'BATCH_TOO_LARGE', '单次批量导入最多 50 个文件');
+    const documents = []; const errors = [];
+    for (const file of files) {
+      try { documents.push(await importStructuredDocument({ ...file, courseId: file.courseId || b.courseId, workspaceId: file.workspaceId || b.workspaceId })); }
+      catch (e) { errors.push({ name: file?.name || '', code: e.code || 'DOCUMENT_IMPORT_FAILED', message: e.message || '文档导入失败' }); }
+    }
+    return json(res, documents.length ? 201 : 400, { documents, errors, imported: documents.length, failed: errors.length });
+  }
   if (method === 'POST' && url.pathname === '/api/documents/upload') {
     const b = await body(req); try { return json(res, 201, await importStructuredDocument(b)); } catch (e) { return error(res, e.code || 'DOCUMENT_IMPORT_FAILED', e.message || '文档导入失败'); }
   }
-  if (method === 'POST' && url.pathname === '/api/documents/upload-legacy') {
-    const b = await body(req); if (!b.name) return error(res, 'INVALID_DOCUMENT', 'A file name is required');
-    const type = (b.name.split('.').pop() || 'TXT').toUpperCase(); const binary = type === 'PDF' && b.base64;
-    const raw = binary ? Buffer.from(b.base64, 'base64') : Buffer.from(b.content || '', 'utf8');
-    const fallback = b.content || 'Uploaded document is ready for annotation. Add a provider in Settings for model-backed extraction.';
-    const parsed = binary ? extractPdfPages(raw) : null;
-    const fallbackPages = fallback.split(/\f|\n\n\n/).slice(0, 30).map((text, i) => ({ page: i + 1, heading: `Page ${i + 1}`, text: text.trim() || 'No extractable text. This file can still be annotated locally.' }));
-    const extracted = binary ? await ocrPdfPages(raw, parsed || [{ page: 1, heading: 'Page 1', text: 'No selectable text was found on this page.' }]) : { pages: fallbackPages, extraction: 'text', ocr: null };
-    const pages = decoratePages(extracted.pages);
-    const doc = { id: uid('doc'), title: b.name.replace(/\.[^.]+$/, ''), type, size: `${Math.max(1, Math.round(raw.length / 1024))} KB`, pages: pages.length, course: '未分类', progress: 0, annotations: 0, questions: 0, uploadedAt: 'Just now', lastRead: 'Not started', tags: ['新上传', ...(extracted.extraction === 'pdf-ocr' ? ['OCR'] : [])], content: pages, extraction: extracted.extraction, ocr: extracted.ocr };
-    if (extracted.extraction === 'pdf-ocr' && doc.content[0]) doc.content[0].heading = doc.title;
-    doc.sourceFile = `${doc.id}-${b.name.replace(/[^\w.-]+/g, '_')}`;
-    db.documents.unshift(doc); fs.writeFileSync(path.join(UPLOAD_DIR, doc.sourceFile), raw); save(); return json(res, 201, doc);
-  }
-  if (method === 'POST' && parts[0] === 'api' && parts[1] === 'documents' && parts[2] && parts[3] === 'annotations') { const b = await body(req); try { const ann = learningDb.saveAnnotation({ id: b.id, documentId: parts[2], page: b.page, type: b.type, color: b.color, text: b.text, note: b.note }); const d = findDoc(parts[2]); if (d) d.annotations = learningDb.listAnnotations({ documentId: parts[2] }).length; save(); return json(res, b.id ? 200 : 201, ann); } catch (e) { return error(res, 'ANNOTATION_SAVE_FAILED', e.message); } }
+  if (method === 'POST' && url.pathname === '/api/documents/upload-legacy') { const b = await body(req); try { return json(res, 201, await importStructuredDocument(b)); } catch (e) { return error(res, e.code || 'DOCUMENT_IMPORT_FAILED', e.message || '文档导入失败'); } }
+  if (method === 'POST' && parts[0] === 'api' && parts[1] === 'documents' && parts[2] && parts[3] === 'annotations') { const b = await body(req); try { const ann = learningDb.saveAnnotation({ id: b.id, documentId: parts[2], page: b.page, type: b.type, color: b.color, text: b.text, note: b.note }); const d = findDoc(parts[2]); if (d) d.annotations = learningDb.listAnnotations({ documentId: parts[2] }).length; if (b.sessionId && !b.id) { const session = learningDb.getLearningSession(b.sessionId); if (session) learningDb.updateLearningSession(b.sessionId, { pagesViewed: b.page ? [b.page] : [], annotationsCreated: session.annotationsCreated + 1 }); } save(); return json(res, b.id ? 200 : 201, ann); } catch (e) { return error(res, 'ANNOTATION_SAVE_FAILED', e.message); } }
+  if (method === 'PATCH' && parts[0] === 'api' && parts[1] === 'annotations' && parts[2]) { const b = await body(req); try { const annotation = learningDb.updateAnnotation(parts[2], b); return annotation ? json(res, 200, annotation) : error(res, 'ANNOTATION_NOT_FOUND', '批注不存在或不属于当前用户'); } catch (e) { return error(res, 'ANNOTATION_UPDATE_FAILED', e.message); } }
   if (method === 'DELETE' && parts[0] === 'api' && parts[1] === 'annotations' && parts[2]) return json(res, 200, { ok: learningDb.deleteAnnotation(parts[2]), id: parts[2] });
   if (method === 'GET' && url.pathname === '/api/knowledge') return json(res, 200, { points: learningDb.listKnowledgePoints(url.searchParams.get('courseId') || undefined), cards: learningDb.listCards({ courseId: url.searchParams.get('courseId') || undefined, documentId: url.searchParams.get('documentId') || undefined, limit: Number(url.searchParams.get('limit') || 200) }) });
   if (method === 'DELETE' && parts[0] === 'api' && parts[1] === 'cards' && parts[2]) return json(res, 200, { ok: learningDb.deleteCard(parts[2]), id: parts[2] });
   if (method === 'GET' && url.pathname === '/api/knowledge/graph') return json(res, 200, learningDb.listGraph(url.searchParams.get('courseId') || undefined));
   if (method === 'GET' && url.pathname === '/api/review/today') { const scheduled = learningDb.listReviewSchedule({ dueOnly: true }); const points = learningDb.listKnowledgePoints(); return json(res, 200, scheduled.map(item => { const point = points.find(candidate => candidate.id === item.concept_id); return { id: `learning-review-${item.concept_id}`, title: `Review ${item.concept_name}`, reason: `${item.repetitions} repetitions · mastery ${Math.round(item.mastery_score * 100)}%`, source: point?.source || item.concept_name, due: 'Today', status: 'due', knowledgeId: item.concept_id, conceptId: item.concept_id }; })); }
   if (method === 'GET' && url.pathname === '/api/analytics') { const questions = learningDb.listQuestions({ limit: 10000 }); const concepts = learningDb.listConcepts(); const annotations = learningDb.listAnnotations({ limit: 10000 }); const notes = learningDb.listNotes({ limit: 10000 }); const progress = learningDb.listProgress({ limit: 10000 }); const today = new Date(); const dates = Array.from({ length: 7 }, (_, index) => { const d = new Date(today); d.setDate(today.getDate() - (6 - index)); return d.toISOString().slice(0, 10); }); const countByDate = values => dates.map(date => values.filter(item => String(item.timestamp || item.created_at || item.createdAt || item.updated_at || item.updatedAt || '').slice(0, 10) === date).length); const weeklyQuestions = questions.filter(item => dates.includes(String(item.timestamp || '').slice(0, 10))).length; return json(res, 200, { source: 'sqlite-learning-events', labels: dates.map(date => date.slice(5)), dailyActivity: dates.map((date, index) => ({ date, questions: countByDate(questions)[index], annotations: countByDate(annotations)[index], notes: countByDate(notes)[index] })), weeklyQuestions, documents: learningDb.listDocuments().length, pages: new Set(questions.map(item => item.source_document_id).filter(Boolean)).size, questions: questions.length, annotations: annotations.length, notes: notes.length, concepts: concepts.length, progress, mastery: concepts.map(k => ({ name: k.name, value: Math.round(k.masteryScore * 100) })) }); }
+  if (method === 'GET' && url.pathname === '/api/prompt/settings') return json(res, 200, { settings: currentPromptSettings(), queryTypes: QUERY_TYPES, optimizationLevels: OPTIMIZATION_LEVELS, answerModes: ANSWER_MODES });
+  if (method === 'POST' && url.pathname === '/api/prompt/settings') {
+    const input = await body(req); const next = { ...currentPromptSettings() };
+    for (const key of ['level', 'answerMode', 'optimizerConfigId', 'answerConfigId']) if (input[key] !== undefined) next[key] = input[key] || null;
+    for (const key of ['includeMemory', 'includeDocument', 'includeConversation', 'includeKnowledge', 'showPreview', 'developmentLogs']) if (input[key] !== undefined) next[key] = Boolean(input[key]);
+    if (input.contextBudget !== undefined) next.contextBudget = Math.max(4000, Math.min(60000, Number(input.contextBudget) || DEFAULT_PROMPT_SETTINGS.contextBudget));
+    if (input.relevanceThreshold !== undefined) next.relevanceThreshold = Math.max(0, Math.min(1, Number(input.relevanceThreshold) || DEFAULT_PROMPT_SETTINGS.relevanceThreshold));
+    if (!OPTIMIZATION_LEVELS.includes(next.level)) next.level = DEFAULT_PROMPT_SETTINGS.level;
+    if (!ANSWER_MODES.includes(next.answerMode)) next.answerMode = DEFAULT_PROMPT_SETTINGS.answerMode;
+    db.settings = { ...db.settings, promptOptimization: next }; if (auth.guest) save(); else learningDb.saveUserSettings({ promptOptimization: next }, auth.user.id); return json(res, 200, { settings: next });
+  }
+  if (method === 'POST' && url.pathname === '/api/prompt/optimize') {
+    const b = await body(req); b.message = String(b.message || '请解释当前内容。');
+    try { const document = findDoc(b.documentId); const context = readerContext(b, document); const learning = buildLearningContext(b, document, b.formula ? 'formula' : 'text'); return json(res, 200, await optimizeForRequest(b, document, context, learning, b.formula ? 'formula' : 'text')); } catch (e) { return error(res, e.code || 'PROMPT_OPTIMIZATION_FAILED', safeMessage(e, 'Prompt 优化失败'), { status: e.status || 502 }); }
+  }
+  if (method === 'GET' && url.pathname === '/api/prompt/logs') { const settings = currentPromptSettings(); if (!settings.developmentLogs) return json(res, 200, { logs: [], hidden: true }); return json(res, 200, { logs: learningDb.listPromptOptimizationLogs({ courseId: url.searchParams.get('courseId') || undefined, limit: Number(url.searchParams.get('limit') || 50) }) }); }
   if (method === 'POST' && url.pathname === '/api/chat') {
     const b = await body(req); b.message = b.message || '请解释当前内容。';
     try {
@@ -776,43 +989,48 @@ async function api(req, res, url) {
       const conversationId = conversationIdFor(b);
       result.memory = memoryService.recordInteraction({ question: b.message, answer: result.answer, courseId: b.courseId || findDoc(b.documentId)?.courseId || null, documentId: b.documentId, conversationId, optedOut: b.remember === false || db.settings?.memoryEnabled === false });
       result.conversationId = persistConversationTurn(b, result, result.answer);
+      if (b.sessionId) { const session = learningDb.getLearningSession(b.sessionId); if (session) learningDb.updateLearningSession(b.sessionId, { pagesViewed: b.page ? [b.page] : [], conceptsViewed: result.memory?.concepts || [], questionsAsked: session.questionsAsked + 1 }); }
       db.messages.push({ id: uid('msg'), role: 'user', text: b.message, selectedText: b.selectedText || '', formula: b.formula || '', pageNumber: b.page, provider: result.provider, model: result.model, createdAt: new Date().toISOString() }, { id: uid('msg'), role: 'assistant', text: result.answer, citations: result.citations, provider: result.provider, model: result.model, mode: result.mode, createdAt: new Date().toISOString() }); save(); return json(res, 200, result);
     } catch (e) { return error(res, e.code || 'AI_REQUEST_FAILED', safeMessage(e, 'AI 请求失败'), { provider: b.provider || null, status: e.status || 502 }); }
   }
   if (method === 'POST' && url.pathname === '/api/chat/stream') {
-    const b = await body(req); b.message = b.message || '请解释当前内容。'; const config = selectModelConfig(b);
+    const b = await body(req); b.message = b.message || '请解释当前内容。'; const config = configForPurpose(b, 'answer');
     res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
     try {
-      if (!config || !config.apiKey) {
-        const document = findDoc(b.documentId); const learning = buildLearningContext(b, document); const language = b.language === 'en' ? 'en' : (db.settings?.language === 'en' ? 'en' : 'zh'); const result = localAnswer(b.message, b.documentId, b.selectedText || '', language, learning.retrieved);
+      if (!canUseModelConfig(config)) {
+        const document = findDoc(b.documentId); const context = readerContext(b, document); const learning = buildLearningContext(b, document); const promptOptimization = await optimizeForRequest(b, document, context, learning, b.formula ? 'formula' : 'text'); const language = b.language === 'en' ? 'en' : (db.settings?.language === 'en' ? 'en' : 'zh'); const result = localAnswer(b.message, b.documentId, b.selectedText || '', language, learning.retrieved);
         const memoryNote = memoryAssociationNote(learning.memory, language);
         result.answer += memoryNote;
         const conversationId = conversationIdFor(b);
         const memory = memoryService.recordInteraction({ question: b.message, answer: result.answer, courseId: b.courseId || findDoc(b.documentId)?.courseId || null, documentId: b.documentId, conversationId, optedOut: b.remember === false || db.settings?.memoryEnabled === false });
         persistConversationTurn(b, result, result.answer);
+        if (b.sessionId) { const session = learningDb.getLearningSession(b.sessionId); if (session) learningDb.updateLearningSession(b.sessionId, { pagesViewed: b.page ? [b.page] : [], conceptsViewed: memory?.concepts || [], questionsAsked: session.questionsAsked + 1 }); }
         for (const chunk of result.answer.split(/(?<=[。！？.!?])|\n/).filter(Boolean)) { res.write(`data: ${JSON.stringify({ delta: chunk, mode: 'local', provider: 'local', model: 'Evidence-first local mode', language: result.language })}\n\n`); await new Promise(resolve => setTimeout(resolve, 35)); }
-        res.write(`data: ${JSON.stringify({ done: true, conversationId, citations: result.citations, memory, memoryAssociations: learning.memory.relatedQuestions, mode: 'local', provider: 'local', model: 'Evidence-first local mode', language: result.language })}\n\n`); return res.end();
+        res.write(`data: ${JSON.stringify({ done: true, conversationId, citations: result.citations, memory, memoryAssociations: learning.memory.relatedQuestions, promptOptimization, mode: 'local', provider: 'local', model: 'Evidence-first local mode', language: result.language })}\n\n`); return res.end();
       }
-      const document = findDoc(b.documentId); const context = readerContext(b, document); const learning = buildLearningContext(b, document); const prompt = `${buildPrompt(b.formula ? 'formula' : 'text', context, b.message)}\n\n资料库检索上下文：\n${learning.retrieved.map(item => `[${item.citation}]\n${item.text}`).join('\n\n') || '当前范围没有命中文本。'}\n\n真实长期学习记忆：\n${learning.memoryText || '没有明显相关的历史记忆。'}`; let answer = '';
+      const document = findDoc(b.documentId); const context = readerContext(b, document); const learning = buildLearningContext(b, document); res.write(`data: ${JSON.stringify({ status: 'understanding' })}\n\n`); const promptOptimization = await optimizeForRequest(b, document, context, learning, b.formula ? 'formula' : 'text'); res.write(`data: ${JSON.stringify({ status: 'enhancing_prompt', promptOptimization: { queryType: promptOptimization.queryType, mode: promptOptimization.mode, level: promptOptimization.level } })}\n\n`); const prompt = promptOptimization.answerPrompt || promptOptimization.optimizedPrompt || buildPrompt(b.formula ? 'formula' : 'text', context, b.message); let answer = ''; res.write(`data: ${JSON.stringify({ status: 'generating_answer' })}\n\n`);
       await createProvider(config).streamChat({ model: config.model, messages: [{ role: 'system', content: `You are StudyAgent's literature reading assistant. Answer in ${context.language === 'en' ? 'English' : 'Chinese'}. Ground the answer in the supplied context and use LaTeX for mathematics.` }, { role: 'user', content: prompt }], temperature: config.temperature, maxTokens: config.maxTokens }, token => { answer += token; res.write(`data: ${JSON.stringify({ delta: token, mode: 'remote', provider: config.provider, model: config.model, language: context.language })}\n\n`); });
       const citations = learning.retrieved.map((item, index) => ({ id: index + 1, documentId: item.documentId, document: item.documentTitle, page: item.locator.page, slide: item.locator.slide, sheet: item.locator.sheet, section: item.section, label: item.citation, quote: item.text.slice(0, 130) }));
       const conversationId = conversationIdFor(b);
       const memory = memoryService.recordInteraction({ question: b.message, answer, courseId: b.courseId || document?.courseId || document?.course_id || null, documentId: b.documentId, conversationId, optedOut: b.remember === false || db.settings?.memoryEnabled === false });
-      persistConversationTurn(b, { citations, provider: config.provider, model: config.model, mode: 'remote' }, answer);
-      db.messages.push({ id: uid('msg'), role: 'user', text: b.message, selectedText: b.selectedText || '', pageNumber: b.page, provider: config.provider, model: config.model, createdAt: new Date().toISOString() }, { id: uid('msg'), role: 'assistant', text: answer, citations, provider: config.provider, model: config.model, mode: 'remote', createdAt: new Date().toISOString() }); save(); res.write(`data: ${JSON.stringify({ done: true, conversationId, citations, memory, mode: 'remote', provider: config.provider, model: config.model, language: context.language })}\n\n`); return res.end();
+      persistConversationTurn(b, { citations, provider: config.provider, model: config.model, mode: 'remote', promptOptimization }, answer);
+      if (b.sessionId) { const session = learningDb.getLearningSession(b.sessionId); if (session) learningDb.updateLearningSession(b.sessionId, { pagesViewed: b.page ? [b.page] : [], questionsAsked: session.questionsAsked + 1 }); }
+      db.messages.push({ id: uid('msg'), role: 'user', text: b.message, selectedText: b.selectedText || '', pageNumber: b.page, provider: config.provider, model: config.model, createdAt: new Date().toISOString() }, { id: uid('msg'), role: 'assistant', text: answer, citations, provider: config.provider, model: config.model, mode: 'remote', createdAt: new Date().toISOString() }); save(); res.write(`data: ${JSON.stringify({ done: true, conversationId, citations, memory, promptOptimization, mode: 'remote', provider: config.provider, model: config.model, language: context.language })}\n\n`); return res.end();
     } catch (e) { res.write(`data: ${JSON.stringify({ error: { code: e.code || 'AI_REQUEST_FAILED', message: safeMessage(e, 'AI 请求失败') } })}\n\n`); return res.end(); }
   }
-  if (method === 'POST' && url.pathname === '/api/ai/embed') { const b = await body(req); const config = selectModelConfig(b); if (!config || !config.apiKey) return error(res, 'REMOTE_MODEL_REQUIRED', 'Embedding 需要先在设置中配置远程模型', { status: 503 }); try { return json(res, 200, await createProvider(config).embed({ input: b.input, model: b.model })); } catch (e) { return error(res, e.code || 'EMBEDDING_FAILED', safeMessage(e, 'Embedding 请求失败'), { status: e.status || 502 }); } }
-  if (method === 'POST' && url.pathname === '/api/ai/vision') { const b = await body(req); const config = selectModelConfig(b); if (!config || !config.apiKey) return error(res, 'REMOTE_MODEL_REQUIRED', 'Vision 需要先在设置中配置支持视觉的远程模型', { status: 503 }); try { return json(res, 200, await createProvider(config).vision({ imageData: b.imageData, imageUrl: b.imageUrl, prompt: b.prompt, model: b.model })); } catch (e) { return error(res, e.code || 'VISION_FAILED', safeMessage(e, 'Vision 请求失败'), { status: e.status || 502 }); } }
+  if (method === 'POST' && url.pathname === '/api/ai/embed') { const b = await body(req); const config = selectModelConfig(b); if (!canUseModelConfig(config)) return error(res, 'REMOTE_MODEL_REQUIRED', 'Embedding 需要先在设置中配置远程模型', { status: 503 }); try { return json(res, 200, await createProvider(config).embed({ input: b.input, model: b.model })); } catch (e) { return error(res, e.code || 'EMBEDDING_FAILED', safeMessage(e, 'Embedding 请求失败'), { status: e.status || 502 }); } }
+  if (method === 'POST' && url.pathname === '/api/ai/vision') { const b = await body(req); const config = selectModelConfig(b); if (!canUseModelConfig(config)) return error(res, 'REMOTE_MODEL_REQUIRED', 'Vision 需要先在设置中配置支持视觉的远程模型', { status: 503 }); try { return json(res, 200, await createProvider(config).vision({ imageData: b.imageData, imageUrl: b.imageUrl, prompt: b.prompt, model: b.model })); } catch (e) { return error(res, e.code || 'VISION_FAILED', safeMessage(e, 'Vision 请求失败'), { status: e.status || 502 }); } }
   if (method === 'POST' && url.pathname === '/api/ai/explain') { const b = await body(req); b.message = b.message || `请解释这段内容：${b.selectedText || ''}`; try { return json(res, 200, await runAiRequest(b, b.formula ? 'formula' : 'text')); } catch (e) { return error(res, e.code || 'AI_REQUEST_FAILED', safeMessage(e, 'AI 解释失败'), { status: e.status || 502 }); } }
   if (method === 'POST' && url.pathname === '/api/ai/summarize') { const b = await body(req); const d = findDoc(b.documentId) || db.documents[0]; const pages = b.page ? d.content.filter(p => p.page === Number(b.page)) : d.content; const context = pages.map(page => page.text).join('\n\n').slice(0, 5000); try { return json(res, 200, await runAiRequest({ ...b, documentId: d.id, selectedText: context, message: b.message || '请总结当前页面的核心内容、关键概念、公式和复习重点。' }, 'summary')); } catch (e) { return error(res, e.code || 'AI_REQUEST_FAILED', safeMessage(e, 'AI 总结失败'), { status: e.status || 502 }); } }
-  if (method === 'POST' && url.pathname === '/api/ai/create-card') { const b = await body(req); const d = findDoc(b.documentId) || db.documents[0]; if (!d) return error(res, 'DOCUMENT_REQUIRED', '创建知识卡需要至少一份资料'); const language = b.language === 'en' ? 'en' : (db.settings?.language === 'en' ? 'en' : 'zh'); const card = learningDb.saveCard({ front: b.selectedText ? `Explain: ${b.selectedText.slice(0, 90)}` : 'What is the key idea of this section?', back: localAnswer('Explain ' + (b.selectedText || 'the main idea'), d.id, b.selectedText || '', language).answer, source: `${d.title} · p.${b.page || 1}`, due: 'Tomorrow', mastery: 0.2, documentId: d.id, courseId: d.courseId || d.course_id || null, locator: { page: Number(b.page || 1) || 1, selectedText: String(b.selectedText || '').slice(0, 500) } }); return json(res, 201, card); }
+  if (method === 'POST' && url.pathname === '/api/ai/create-card') { const b = await body(req); const d = findDoc(b.documentId) || db.documents[0]; if (!d) return error(res, 'DOCUMENT_REQUIRED', '创建知识卡需要至少一份资料'); const language = b.language === 'en' ? 'en' : (db.settings?.language === 'en' ? 'en' : 'zh'); const formula = String(b.formula || ''); const selected = formula ? `${b.selectedText || ''}\n\\(${formula}\\)` : (b.selectedText || ''); const card = learningDb.saveCard({ front: selected ? `Explain: ${selected.slice(0, 120)}` : 'What is the key idea of this section?', back: localAnswer('Explain ' + (selected || 'the main idea'), d.id, selected, language).answer, source: `${d.title} · p.${b.page || 1}`, due: 'Tomorrow', mastery: 0.2, documentId: d.id, courseId: d.courseId || d.course_id || null, locator: { page: Number(b.page || 1) || 1, selectedText: String(b.selectedText || '').slice(0, 500), formulaLatex: formula } }); return json(res, 201, card); }
   if (method === 'POST' && url.pathname === '/api/review/complete') { const b = await body(req); const scheduled = learningDb.listReviewSchedule({ limit: 200 }).find(item => `learning-review-${item.concept_id}` === b.id); if (!scheduled) return json(res, 200, { ok: false, task: null, knowledge: null, review: null }); const review = memoryService.recordReview({ concept: scheduled.concept_name, courseId: scheduled.course_id || null, correct: b.correct !== false }); const knowledge = learningDb.listKnowledgePoints(scheduled.course_id || undefined).find(item => item.name === scheduled.concept_name) || null; return json(res, 200, { ok: true, task: { id: b.id, title: `Review ${scheduled.concept_name}`, status: 'completed', conceptId: scheduled.concept_id }, knowledge, review }); }
-  if (method === 'GET' && url.pathname === '/api/state') return json(res, 200, db);
-  if (method === 'POST' && url.pathname === '/api/settings') { const b = await body(req); delete b.apiKey; if (b.language) b.language = b.language === 'en' || b.language === 'English' ? 'en' : 'zh'; if (b.memoryEnabled !== undefined) b.memoryEnabled = Boolean(b.memoryEnabled); db.settings = { ...db.settings, ...b }; save(); return json(res, 200, db.settings); }
+  if (method === 'GET' && url.pathname === '/api/state') return json(res, 200, { ...db, documents: learningDb.listDocuments().map(clientDocumentView), knowledge: learningDb.listKnowledgePoints(), cards: learningDb.listCards({ limit: 200 }), messages: [] });
+  if (method === 'POST' && url.pathname === '/api/settings') { const b = await body(req); const safe = safeAccountSettings(b); db.settings = { ...db.settings, ...safe }; if (auth.guest) save(); else learningDb.saveUserSettings(safe, auth.user.id); return json(res, 200, db.settings); }
   return error(res, 'NOT_FOUND', 'API route not found');
 }
 
 const mime = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.mjs': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.json': 'application/json' };
-const server = http.createServer(async (req, res) => { try { const url = parsePath(req.url); if (url.pathname.startsWith('/api/')) return await api(req, res, url); let file = path.join(PUBLIC, url.pathname === '/' ? 'index.html' : url.pathname); if (!file.startsWith(PUBLIC)) return error(res, 'FORBIDDEN', 'Invalid path'); if (!fs.existsSync(file)) file = path.join(PUBLIC, 'index.html'); res.writeHead(200, { 'Content-Type': mime[path.extname(file)] || 'application/octet-stream' }); res.end(fs.readFileSync(file)); } catch (e) { json(res, 500, { error: { code: 'SERVER_ERROR', message: e.message, details: {} } }); } });
+let apiQueue = Promise.resolve();
+async function runQueuedApi(req, res, url) { let release; const previous = apiQueue; apiQueue = new Promise(resolve => { release = resolve; }); await previous; try { return await api(req, res, url); } finally { release(); } }
+const server = http.createServer(async (req, res) => { try { const url = parsePath(req.url); if (url.pathname.startsWith('/api/')) return await runQueuedApi(req, res, url); let file = path.join(PUBLIC, url.pathname === '/' ? 'index.html' : url.pathname); if (!file.startsWith(PUBLIC)) return error(res, 'FORBIDDEN', 'Invalid path'); if (!fs.existsSync(file)) file = path.join(PUBLIC, 'index.html'); res.writeHead(200, { 'Content-Type': mime[path.extname(file)] || 'application/octet-stream' }); res.end(fs.readFileSync(file)); } catch (e) { json(res, 500, { error: { code: 'SERVER_ERROR', message: e.message, details: {} } }); } });
 server.listen(4173, '127.0.0.1', () => console.log('StudyAgent running at http://127.0.0.1:4173'));

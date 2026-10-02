@@ -12,7 +12,15 @@
     "check:syntax": "node scripts/check-syntax.mjs",
     "test": "node scripts/check-learning-core.mjs",
     "check:http": "node scripts/check-learning-http.mjs",
-    "check:pdf": "node scripts/check-pdf-regression.mjs"
+    "check:closure": "node scripts/check-learning-closure.mjs",
+    "check:auth": "node scripts/check-auth.mjs",
+    "check:math-ocr": "node scripts/check-math-ocr.mjs",
+    "check:math-ocr:http": "node scripts/check-math-ocr-http.mjs",
+    "check:multiformat:http": "node scripts/check-multiformat-http.mjs",
+    "check:lectures": "node scripts/check-lecture-folder.mjs",
+    "check:pdf": "node scripts/check-pdf-regression.mjs",
+    "check:all": "node scripts/check-all.mjs",
+    "verify": "node scripts/check-all.mjs"
   },
   "dependencies": {
     "@tesseract.js-data/chi_sim": "^1.0.0",
