@@ -1,4 +1,5 @@
 function createLearningOrchestrator({ ragService, memoryService, learningDb }) {
+  function emptyMemory() { return { concepts: [], relatedConcepts: [], graphRelations: [], relatedQuestions: [], relatedMemories: [], profile: null, weakConcepts: [] }; }
   function detectIntent(question = '', kind = 'text') {
     const value = String(question).toLowerCase();
     if (kind === 'summary' || /总结|摘要|summar/.test(value)) return 'summary';
@@ -8,8 +9,13 @@ function createLearningOrchestrator({ ragService, memoryService, learningDb }) {
     return 'tutor';
   }
   function prepare({ question = '', body = {}, document = null, kind = 'text', scope = {} }) {
-    const memory = memoryService.retrieve(question, { courseId: body.courseId || document?.courseId || null, limit: 6 });
+    const memory = body.memoryEnabled === false
+      ? emptyMemory()
+      : memoryService.retrieve(question, { courseId: body.courseId || document?.courseId || null, limit: 6 });
     const retrieved = ragService.context(question, scope);
+    const annotations = document?.id ? learningDb.listAnnotations({ documentId: document.id, page: scope.page }) : [];
+    const notes = document?.id ? learningDb.listNotes({ documentId: document.id, limit: 40 }) : [];
+    const recentConversation = body.conversationId ? learningDb.listConversationMessages(body.conversationId, 8) : [];
     const graph = learningDb.listGraph(body.courseId || undefined);
     const relatedConceptNames = new Set(memory.concepts || []);
     const relatedIds = new Set(graph.nodes.filter(node => relatedConceptNames.has(node.label)).map(node => node.id));
@@ -18,7 +24,7 @@ function createLearningOrchestrator({ ragService, memoryService, learningDb }) {
     const agents = ['DocumentAgent', 'RetrievalAgent', 'MemoryAgent'];
     if (relations.length) agents.push('KnowledgeGraphAgent');
     agents.push(kind === 'summary' ? 'SummaryAgent' : kind === 'quiz' ? 'QuizAgent' : 'TutorAgent');
-    return { intent: detectIntent(question, kind), agents, scope: body.scope || 'current-document', retrieved, memory, graph: { relations }, memoryText: memoryService.contextText(memory) };
+    return { intent: detectIntent(question, kind), agents, scope: body.scope || 'current-document', retrieved, memory, graph: { relations }, annotations, notes, recentConversation, memoryText: memoryService.contextText(memory) };
   }
   return { detectIntent, prepare };
 }
