@@ -116,3 +116,205 @@ HTTP 集成检查（`npm run check:http`）会调用真实的本地服务，验�
 - 默认向量实现是确定性的本地哈希向量（`local-hash-v1`），目的是保证离线可用。它不等同于神经网络向量模型；虽然已经存在模型服务提供的 `embed()` 适配器，但默认不会启用基于远程向量模型的索引。
 - 公式恢复默认使用 PDF 文本/OCR 证据上的本地启发式层；设置 Mathpix App ID 和 App Key 后，解析视图可以调用专用数学 OCR，并将 LaTeX、MathML 和逐行公式结果写回页面、分块与检索索引。原始 PDF 视图仍是排版权威，解析视图会同时暴露 LaTeX 候选结果和原始识别文本，便于人工修正。未配置 Mathpix 时保留本地回退，不伪造远程识别结果。
 - 持久化数据、按页面检索、可编辑的知识图谱节点详情与概念关系、动态 Workspace/Course/Document 页面、基于 SQLite 的每日总结、基于检索内容的测验生成、测验结果持久化、自适应复习间隔以及学习编排器计划均已实现。测验接口会明确使用 `retrieval-grounded-local` 模式；未配置远程模型时不会假装自己是远程 LLM。更丰富的自适应复习 Agent 体验和调度分析仍明确不属于本次迭代范围，而不是用隐藏的模拟功能冒充已经完成。
+
+## 功能详解：从资料到长期学习记忆
+
+StudyAgent 的核心不是某个单独页面，而是下面这条可追踪的数据链：
+
+```text
+选择课程/资料
+    ↓
+阅读页面、幻灯片或工作表
+    ↓
+文本/公式选择与批注
+    ↓
+基于选中文本提问
+    ↓
+文档 + RAG + 批注 + 历史问题 + 学习记忆
+    ↓
+带来源的 AI 回答
+    ↓
+学习笔记与 Learning Experience
+    ↓
+概念抽取与归一化
+    ↓
+个人知识图谱
+    ↓
+掌握度、错误记忆和复习队列
+    ↓
+下一次提问获得个性化上下文
+```
+
+### 资料导入与结构化解析
+
+资料导入不会只生成一个纯文本文件，而是统一转成带来源位置的 Document Model：
+
+```text
+Document
+├── id / user_id / course_id
+├── title / file_type / source_path
+├── metadata
+├── sections
+│   ├── page / slide / sheet / chapter
+│   ├── title / position
+│   └── structured content blocks
+├── chunks
+└── embeddings
+```
+
+不同格式会尽量保留各自结构：
+
+- PDF 保存页码、标题、段落、表格、图片、文本层和 OCR 结果；
+- DOCX 保存 Heading、段落、列表、表格、图片和公式候选；
+- PPTX 保存 Slide 编号、标题、文本框、备注、表格和图片；
+- XLSX 保存 Sheet、单元格地址、表头、数据类型和表格区域；
+- Markdown 保存标题层级、段落、列表、表格和代码块；
+- 图片资料保存 OCR 文本、图片元数据，并提供图表/公式 Vision 分析入口。
+
+解析后的页面或区段会进入 SQLite、Chunk 索引和阅读器。阅读器展示的文件名直接来自上传文件名；引用则携带文档 ID、页码/幻灯片/工作表和区段位置，便于从 AI 回答回到原始资料。
+
+### OCR、公式和原始排版
+
+扫描 PDF 和图片会经过本地 OCR。PDF 没有文本层时，系统先将页面渲染为图片，再进行中文识别；解析结果会保留原始文本和置信度。常见数学表达式会被识别为公式块并规范化为 LaTeX，前端使用 MathML/可视公式展示，避免用户直接看到 `\\frac`、转义符或 OCR 乱码。
+
+阅读器同时保留两种视图：
+
+1. 解析视图：适合选择、搜索、批注、RAG 和 AI 提问；
+2. 原始排版视图：直接展示上传的 PDF 页面图片，作为版式权威来源。
+
+对于复杂公式、低清扫描或本地 OCR 置信度不足的页面，可以在设置中配置 Mathpix App ID 和 App Key，主动执行“专用数学 OCR 重识本页”。密钥只保存于本地服务端加密配置，不会发送到前端或提交 Git。
+
+### 阅读、选择、批注与学习笔记
+
+用户可以在当前页面选择普通文本、公式或混合内容，然后执行：
+
+- 解释、总结、详细推导、举例和“为什么”；
+- 高亮、创建笔记、创建知识卡片和生成复习题；
+- 标记“这里没理解”“考试重点”或自定义问题；
+- 使用“与之前知识关联”查看历史学习内容。
+
+每条批注都带有 `user_id`、`course_id`、`document_id`、页面/区段、选中文本、公式 LaTeX、类型和时间戳。批注可以编辑、删除、搜索和按课程/概念聚合。学习 Session 结束后，系统不会简单拼接聊天记录，而是把高亮、批注、问题、回答、困难点和重点整理为 Learning Note 与 Learning Experience。
+
+### AI 阅读上下文与 RAG
+
+用户问“这里为什么需要这个条件？”时，Agent 会保留当前页面和选中文本，不要求用户重新复制上下文。上下文可能包括：
+
+- 当前文档、课程和页面内容；
+- 当前选中文本和公式 LaTeX；
+- 页面附近段落、表格或备注；
+- 当前课程或指定文件的检索结果；
+- 当前会话中的连续追问；
+- 相关批注、笔记和知识卡片；
+- 历史问题、概念图谱和薄弱知识；
+- 用户设置的回答语言、公式表达偏好和详细程度。
+
+检索采用结构感知分块、关键词候选、向量相似度和相关性阈值过滤。每个 Chunk 保留 `blockType`、`blockIndex`、页码/幻灯片/工作表/章节等元数据，回答可以生成“《某讲义》第 12 页”的来源引用。
+
+### 多模型 API 与本地模式
+
+设置页支持 OpenAI、DeepSeek、Claude、Gemini、OpenRouter、SiliconFlow、Moonshot/Kimi、智谱、通义千问、Ollama 和自定义 OpenAI-compatible 服务。统一 Provider 接口包括：
+
+```text
+chat()    普通对话
+stream()  流式回答
+embed()   生成向量
+vision()  分析图片、图表和公式
+```
+
+默认本地模式不调用外部服务，使用本地检索和结构化资料回答，并显式返回 `mode: "local"`。配置远程服务后，服务端会根据用户选择调用对应模型；不同 Provider 的请求格式、Base URL、模型列表发现和错误信息由服务端适配器处理。前端永远不会获得完整 API Key。
+
+### 长期记忆、学习经历与知识图谱
+
+长期记忆与聊天记录分开保存，主要包括：
+
+- User Profile Memory：学习目标、回答风格、公式风格和常用语言；
+- Concept Memory：概念别名、来源、掌握状态和相关概念；
+- Question Memory：历史问题、答案摘要、难度和解决状态；
+- Error Memory：错题、误解、容易混淆的概念；
+- Learning Progress：阅读、批注、提问、复习和测验证据；
+- Conversation Memory：当前会话的连续指代和追问。
+
+概念会进行归一化，避免同一个知识点因为中英文名称不同而重复建节点。知识图谱关系包括 `RELATED_TO`、`PREREQUISITE_OF`、`DERIVED_FROM`、`CONFUSED_WITH`、`SOLVED_BY`、`MENTIONED_IN` 和 `LEARNED_WITH`。再次学习同一概念时更新掌握度、置信度、提问次数、批注次数和最近复习时间，而不是创建重复概念。
+
+掌握度不会仅根据“看过一次”计算。系统综合阅读、批注、连续提问、反例请求、错误理解、测验结果和复习记录；证据不足时使用 `Unknown`、`Low Evidence`、`Developing`、`Familiar` 等状态，避免输出没有依据的伪精确百分比。
+
+知识图谱节点可以反向打开来源资料、历史问题、相关批注、学习经历和复习建议。学习总结会区分 `rawEvidence` 与 `interpretation`：前者是可核验事件，后者是 Agent 基于证据得出的推断。
+
+## 页面与模块导航
+
+| 页面/模块 | 作用 |
+| --- | --- |
+| 首页 Home | 查看学习统计、继续阅读、今日重点和最近学习活动 |
+| 资料库 Library | 管理 Workspace、Course 和 Document，导入多格式资料 |
+| 课程 Courses | 创建课程、组织讲义、查看课程进度 |
+| 阅读 Reading | 阅读原始排版或解析内容，选择文本/公式，创建批注并提问 |
+| AI Chat | 在工作区、课程、当前文件或当前页面范围内进行对话 |
+| 知识库 Knowledge | 查看记忆、概念、知识卡片、学习经历和可导出的个人学习数据 |
+| 笔记 Notes | 管理带来源位置的学习笔记并回到原文 |
+| 复习 Review | 查看复习队列、生成多类型自测题并更新学习状态 |
+| 学习分析 Learning Analytics | 查看阅读、提问、批注、概念和复习等可核验统计 |
+| 设置 Settings | 选择语言、配置模型、管理长期记忆和专用数学 OCR |
+
+## 数据持久化与安全边界
+
+主要本地数据位置：
+
+```text
+data/studyagent.sqlite       # 文档、区段、分块、对话、笔记、记忆、图谱和进度
+data/studyagent.json         # 旧版种子数据兼容文件
+data/model-config.enc        # 游客模型配置的本地加密文件
+data/model-configs/           # 登录用户模型配置
+uploads/                      # 用户上传的原始资料
+```
+
+这些路径已被 `.gitignore` 排除。账号密码使用服务端 scrypt 哈希保存，会话使用 HttpOnly、SameSite Cookie。登录后文档、课程、对话、批注、笔记、RAG、知识图谱、模型配置和长期记忆都按 `user_id` 隔离；游客不会写入长期学习记忆。
+
+本地加密用于降低配置文件被直接读取的风险，不等同于云端 Secret Manager，也不能替代 Windows Credential Manager。API Key 不应出现在 README、前端代码、提交记录、截图或测试日志中。
+
+## 开发者快速开始
+
+```powershell
+npm install
+npm start
+```
+
+打开 <http://127.0.0.1:4173>。如需开发 Agent Context Inspector：
+
+```powershell
+$env:STUDYAGENT_DEV_CONTEXT = '1'
+npm start
+```
+
+常用验证：
+
+```powershell
+npm run check:syntax
+npm test
+npm run check:pdf
+npm run check:http
+npm run check:multiformat:http
+npm run check:auth
+npm run check:learning:closure
+npm run verify
+```
+
+`npm run verify` 等同于完整回归入口，会覆盖语法、数学 OCR、核心数据层、账号隔离、多格式导入、真实学习闭环、PDF 高代讲义和桌面讲义目录。桌面讲义回归默认扫描 `C:\Users\<当前用户>\Desktop\讲义`，也可以通过 `STUDYAGENT_LECTURE_DIR` 指定其他目录。
+
+## 团队协作建议
+
+1. 从 `main` 创建功能分支；
+2. 修改解析器、OCR 或公式显示后运行 `npm run check:pdf`；
+3. 修改 API、SQLite、记忆或 RAG 后运行 `npm run check:http` 和对应学习闭环检查；
+4. 修改账号或权限后运行 `npm run check:auth`；
+5. 提交前运行 `npm run verify`；
+6. 使用 Pull Request 合并，并在描述中记录测试命令和已知限制。
+
+推荐提交信息：
+
+```text
+feat: add ...
+fix: correct ...
+docs: update ...
+test: cover ...
+refactor: improve ...
+```
