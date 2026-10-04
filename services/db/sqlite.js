@@ -1,6 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { AsyncLocalStorage } = require('async_hooks');
 const { DatabaseSync } = require('node:sqlite');
 
 const schema = `
@@ -124,9 +125,11 @@ function createLearningDb(file) {
   database.exec("UPDATE annotations SET user_id=(SELECT user_id FROM documents WHERE documents.id=annotations.document_id) WHERE user_id IS NULL OR user_id=''");
   database.exec("UPDATE annotations SET course_id=(SELECT course_id FROM documents WHERE documents.id=annotations.document_id) WHERE course_id IS NULL");
   database.exec("UPDATE annotations SET updated_at=created_at WHERE updated_at='' OR updated_at IS NULL");
-  let activeUserId = 'user-local';
-  function currentUserId() { return activeUserId; }
-  function setUserId(userId) { activeUserId = String(userId || 'user-local'); return activeUserId; }
+  const userContext = new AsyncLocalStorage();
+  let fallbackUserId = 'user-local';
+  function currentUserId() { return userContext.getStore() || fallbackUserId; }
+  function setUserId(userId) { fallbackUserId = String(userId || 'user-local'); return fallbackUserId; }
+  function runAsUser(userId, callback) { return userContext.run(String(userId || 'user-local'), callback); }
   function defaultWorkspaceId(userId = currentUserId()) { return userId === 'user-local' ? 'workspace-personal' : `workspace-${String(userId).replace(/[^a-zA-Z0-9_-]/g, '-')}`; }
   const stmt = sql => database.prepare(sql);
 
@@ -425,7 +428,7 @@ function createLearningDb(file) {
     return { exportedAt: now(), user: getUserById(), settings: getUserSettings(), workspaces: listWorkspaces(), courses: listCourses(), documents, conversations, memories: listMemories({ active: false, limit: 10000 }), concepts: listConcepts(), relations: listGraph().edges, questions: listQuestions({ limit: 10000 }), errors: listErrors({ limit: 10000 }), progress: listProgress({ limit: 10000 }), notes: listNotes({ limit: 10000 }), cards: listCards({ limit: 10000 }), learningSessions: listLearningSessions({ limit: 10000 }), learningNotes: listLearningNotes({ limit: 10000 }), learningExperiences: listLearningExperiences({ limit: 10000 }) };
   }
 
-  return { database, ensureBootstrap, currentUserId, setUserId, defaultWorkspaceId, ensureUserSpace, createUserAccount, getUserByEmail, getUserById, getUserAuthByEmail, updateUserAccount, updateUserPassword, getUserSettings, saveUserSettings, createSession, getSession, deleteSession, deleteUserAccount, upsertDocument, listDocuments, getDocument, deleteDocument, getDocumentContext, searchChunks, listCourses, listWorkspaces, getWorkspace, getCourse, createWorkspace, createCourse, updateDocumentOrganization, upsertConversation, saveConversationMessage, listConversations, listConversationMessages, saveMemory, listMemories, updateMemory, touchMemories, savePromptOptimizationLog, getPromptOptimizationLog, listPromptOptimizationLogs, getUserProfile, saveUserProfile, deleteUserProfile, upsertConcept, listConcepts, listKnowledgePoints, saveQuestion, listQuestions, listErrors, recordProgress, listProgress, saveQuizAttempt, listQuizAttempts, updateReviewSchedule, listReviewSchedule, clearCourseMemory, saveRelation, deleteRelation, getConceptDetails, listGraph, listCards, saveCard, deleteCard, listAnnotations, saveAnnotation, updateAnnotation, deleteAnnotation, listNotes, saveNote, deleteNote, startLearningSession, getLearningSession, listLearningSessions, updateLearningSession, saveLearningNote, getLearningNote, listLearningNotes, saveLearningExperience, getLearningExperience, listLearningExperiences, saveEmbedding, getEmbeddings, deleteMemory, exportMemory, exportUserData, close: () => database.close() };
+  return { database, ensureBootstrap, currentUserId, setUserId, runAsUser, defaultWorkspaceId, ensureUserSpace, createUserAccount, getUserByEmail, getUserById, getUserAuthByEmail, updateUserAccount, updateUserPassword, getUserSettings, saveUserSettings, createSession, getSession, deleteSession, deleteUserAccount, upsertDocument, listDocuments, getDocument, deleteDocument, getDocumentContext, searchChunks, listCourses, listWorkspaces, getWorkspace, getCourse, createWorkspace, createCourse, updateDocumentOrganization, upsertConversation, saveConversationMessage, listConversations, listConversationMessages, saveMemory, listMemories, updateMemory, touchMemories, savePromptOptimizationLog, getPromptOptimizationLog, listPromptOptimizationLogs, getUserProfile, saveUserProfile, deleteUserProfile, upsertConcept, listConcepts, listKnowledgePoints, saveQuestion, listQuestions, listErrors, recordProgress, listProgress, saveQuizAttempt, listQuizAttempts, updateReviewSchedule, listReviewSchedule, clearCourseMemory, saveRelation, deleteRelation, getConceptDetails, listGraph, listCards, saveCard, deleteCard, listAnnotations, saveAnnotation, updateAnnotation, deleteAnnotation, listNotes, saveNote, deleteNote, startLearningSession, getLearningSession, listLearningSessions, updateLearningSession, saveLearningNote, getLearningNote, listLearningNotes, saveLearningExperience, getLearningExperience, listLearningExperiences, saveEmbedding, getEmbeddings, deleteMemory, exportMemory, exportUserData, close: () => database.close() };
 }
 
 module.exports = { createLearningDb };

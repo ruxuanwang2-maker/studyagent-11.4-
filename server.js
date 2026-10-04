@@ -2,6 +2,7 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { AsyncLocalStorage } = require('async_hooks');
 const zlib = require('zlib');
 const os = require('os');
 const { execFile, execFileSync } = require('child_process');
@@ -77,9 +78,16 @@ const seed = {
   settings: { provider: 'Local Study Agent', model: 'Evidence-first local mode', apiKey: '', language: '中文', privacy: 'retrieved-chunks', retrievalK: 8 }
 };
 
-function load() { if (!fs.existsSync(DATA_FILE)) { fs.writeFileSync(DATA_FILE, JSON.stringify(seed, null, 2)); return structuredClone(seed); } try { return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')); } catch { return structuredClone(seed); } }
+function load() { if (!fs.existsSync(DATA_FILE)) { fs.writeFileSync(DATA_FILE, JSON.stringify(seed, null, 2)); return structuredClone(seed); } try { const data = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')); if (Array.isArray(data.messages) && data.messages.length) { data.messages = []; fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2)); } else data.messages = []; return data; } catch { return structuredClone(seed); } }
 let db = load();
-function save() { fs.writeFileSync(DATA_FILE, JSON.stringify(db, null, 2)); }
+const requestSettingsContext = new AsyncLocalStorage();
+const requestModelConfigContext = new AsyncLocalStorage();
+function currentSettings() { return requestSettingsContext.getStore()?.value || db.settings || {}; }
+function currentModelConfigs() { return requestModelConfigContext.getStore()?.configs || modelConfigs; }
+function replaceModelConfigs(configs) { const context = requestModelConfigContext.getStore(); if (context) context.configs = configs; else modelConfigs = configs; }
+const legacySeedSnapshot = structuredClone(db);
+let legacySeedWritable = true;
+function save() { if (legacySeedWritable) fs.writeFileSync(DATA_FILE, JSON.stringify({ ...legacySeedSnapshot, settings: db.settings || legacySeedSnapshot.settings, messages: [] }, null, 2)); }
 if (db.settings?.apiKey) { delete db.settings.apiKey; save(); }
 if (db.settings?.language === '中文' || db.settings?.language === 'English') { db.settings.language = db.settings.language === 'English' ? 'en' : 'zh'; save(); }
 const learningDb = createLearningDb(path.join(DATA_DIR, 'studyagent.sqlite'));
@@ -94,10 +102,8 @@ const DEFAULT_PROMPT_SETTINGS = { level: 'automatic', includeMemory: true, inclu
 const hadPromptSettings = Boolean(db.settings?.promptOptimization);
 db.settings = { ...(db.settings || {}), promptOptimization: { ...DEFAULT_PROMPT_SETTINGS, ...(db.settings?.promptOptimization || {}) } };
 if (!hadPromptSettings) save();
-for (const indexedDocument of learningDb.listDocuments()) ragService.indexChunks(learningDb.getDocumentContext(indexedDocument.id));
 const modelConfigStore = createConfigStore(path.join(DATA_DIR, 'model-config.enc'));
 let modelConfigs = modelConfigStore.read();
-let modelConfigUserId = 'user-local';
 const modelConfigStores = new Map([['user-local', modelConfigStore]]);
 function modelStoreFor(userId) {
   const key = String(userId || 'user-local');
@@ -107,12 +113,23 @@ function modelStoreFor(userId) {
   }
   return modelConfigStores.get(key);
 }
-function syncModelConfigs(userId) {
-  const key = String(userId || 'user-local');
-  if (key === modelConfigUserId) return;
-  modelConfigs = modelStoreFor(key).read();
-  modelConfigUserId = key;
+function resetGuestWorkspace() {
+  const seedFiles = new Set((legacySeedSnapshot.documents || []).map(document => document.sourceFile).filter(Boolean).map(name => path.basename(name)));
+  const guestDocuments = learningDb.runAsUser('user-local', () => learningDb.listDocuments());
+  learningDb.runAsUser('user-local', () => learningDb.deleteUserAccount('user-local'));
+  learningDb.runAsUser('user-local', () => learningDb.ensureBootstrap(legacySeedSnapshot));
+  for (const document of guestDocuments) {
+    const file = path.resolve(UPLOAD_DIR, path.basename(document.source_path || document.sourceFile || ''));
+    if (!seedFiles.has(path.basename(file)) && file.startsWith(`${path.resolve(UPLOAD_DIR)}${path.sep}`) && fs.existsSync(file)) fs.rmSync(file, { force: true });
+  }
+  modelStoreFor('user-local').write([]);
+  modelConfigStores.set('user-local', modelStoreFor('user-local'));
+  for (const document of learningDb.runAsUser('user-local', () => learningDb.listDocuments())) ragService.indexChunks(learningDb.runAsUser('user-local', () => learningDb.getDocumentContext(document.id)));
 }
+resetGuestWorkspace();
+for (const indexedDocument of learningDb.listDocuments()) ragService.indexChunks(learningDb.getDocumentContext(indexedDocument.id));
+legacySeedWritable = false;
+
 const modelListCache = new Map();
 function maskKey(value) { const key = String(value || ''); return key ? `${key.slice(0, 3)}${'•'.repeat(Math.max(4, Math.min(12, key.length - 3)))}${key.slice(-3)}` : ''; }
 function publicModelConfig(config) {
@@ -125,18 +142,18 @@ function normalizeModelConfig(input, previous = {}) {
   const apiKey = input.apiKey && !String(input.apiKey).includes('•') ? String(input.apiKey) : String(previous.apiKey || '');
   return { id: previous.id || input.id || uid('model'), provider, providerName: input.providerName || previous.providerName || preset.name, apiType: input.apiType || previous.apiType || preset.apiType, model: input.model || previous.model || preset.models?.[0]?.id || '', apiKey, appId: input.appId || previous.appId || '', baseUrl: input.baseUrl ?? previous.baseUrl ?? preset.baseUrl, organizationId: input.organizationId || previous.organizationId || '', headers: input.headers || previous.headers || {}, temperature: Number(input.temperature ?? previous.temperature ?? 0.2), maxTokens: Number(input.maxTokens ?? previous.maxTokens ?? 1200), timeout: Number(input.timeout ?? previous.timeout ?? 45000), streaming: input.streaming !== undefined ? Boolean(input.streaming) : previous.streaming !== false, purpose: ['answer', 'optimizer', 'both', 'math-ocr'].includes(input.purpose || previous.purpose) ? (input.purpose || previous.purpose) : 'both', isDefault: Boolean(input.isDefault ?? previous.isDefault), createdAt: previous.createdAt || new Date().toISOString(), updatedAt: new Date().toISOString() };
 }
-function persistModelConfigs() { modelStoreFor(modelConfigUserId).write(modelConfigs); }
+function persistModelConfigs() { modelStoreFor(learningDb.currentUserId()).write(currentModelConfigs()); }
 function isMathOcrConfig(config) { return config?.apiType === 'mathpix' || config?.provider === 'mathpix' || config?.purpose === 'math-ocr'; }
 function canUseModelConfig(config) { return Boolean(config && (config.apiKey || config.provider === 'ollama')); }
-function defaultModelConfig() { return modelConfigs.find(config => config.isDefault && canUseModelConfig(config) && !isMathOcrConfig(config)) || modelConfigs.find(config => canUseModelConfig(config) && !isMathOcrConfig(config)); }
-function selectModelConfig(input = {}) { if (input.configId === 'local' || input.provider === 'local' || input.mode === 'local') return null; return (input.configId && modelConfigs.find(config => config.id === input.configId && canUseModelConfig(config) && !isMathOcrConfig(config))) || (input.provider && modelConfigs.find(config => config.provider === input.provider && canUseModelConfig(config) && !isMathOcrConfig(config) && (!input.model || config.model === input.model))) || defaultModelConfig(); }
-function mathOcrConfig() { return modelConfigs.find(config => isMathOcrConfig(config) && config.apiKey && (config.appId || config.organizationId)); }
+function defaultModelConfig() { return currentModelConfigs().find(config => config.isDefault && canUseModelConfig(config) && !isMathOcrConfig(config)) || currentModelConfigs().find(config => canUseModelConfig(config) && !isMathOcrConfig(config)); }
+function selectModelConfig(input = {}) { if (input.configId === 'local' || input.provider === 'local' || input.mode === 'local') return null; return (input.configId && currentModelConfigs().find(config => config.id === input.configId && canUseModelConfig(config) && !isMathOcrConfig(config))) || (input.provider && currentModelConfigs().find(config => config.provider === input.provider && canUseModelConfig(config) && !isMathOcrConfig(config) && (!input.model || config.model === input.model))) || defaultModelConfig(); }
+function mathOcrConfig() { return currentModelConfigs().find(config => isMathOcrConfig(config) && config.apiKey && (config.appId || config.organizationId)); }
 function readerContext(body, document) {
   const page = document?.content?.find(item => item.page === Number(body.page || 0));
   const text = page?.text || '';
   const selected = String(body.selectedText || '').trim();
   const position = selected ? text.indexOf(selected) : -1;
-  return { documentId: document?.id, documentTitle: document?.title, pageNumber: page?.page, selectedText: selected, formula: body.formula || '', surroundingText: position >= 0 ? text.slice(Math.max(0, position - 360), Math.min(text.length, position + selected.length + 360)) : text.slice(0, 900), userQuestion: body.message || '', language: body.language === 'en' ? 'en' : (db.settings?.language === 'en' ? 'en' : 'zh') };
+  return { documentId: document?.id, documentTitle: document?.title, pageNumber: page?.page, selectedText: selected, formula: body.formula || '', surroundingText: position >= 0 ? text.slice(Math.max(0, position - 360), Math.min(text.length, position + selected.length + 360)) : text.slice(0, 900), userQuestion: body.message || '', language: body.language === 'en' ? 'en' : (currentSettings().language === 'en' ? 'en' : 'zh') };
 }
 function learningScope(body, document) {
   const scope = body.scope || 'current-document';
@@ -149,7 +166,7 @@ function learningScope(body, document) {
 }
 function buildLearningContext(body, document, kind = body.formula ? 'formula' : 'text') {
   const options = learningScope(body, document);
-  const scopedBody = { ...body, memoryEnabled: db.settings?.memoryEnabled !== false };
+  const scopedBody = { ...body, memoryEnabled: currentSettings().memoryEnabled !== false };
   return learningOrchestrator.prepare({ question: body.message || '', body: scopedBody, document, kind, scope: options });
 }
 function memoryAssociationNote(memory, language) {
@@ -161,18 +178,18 @@ function memoryAssociationNote(memory, language) {
     : (english ? `- You previously asked: “${item.question}”` : `- 你之前问过：“${item.question}”`));
   return english ? `\n\nConnection to your previous learning:\n${lines.join('\n')}` : `\n\n与你之前学习内容的关联：\n${lines.join('\n')}`;
 }
-function currentPromptSettings() { return { ...DEFAULT_PROMPT_SETTINGS, ...(db.settings?.promptOptimization || {}) }; }
+function currentPromptSettings() { return { ...DEFAULT_PROMPT_SETTINGS, ...(currentSettings().promptOptimization || {}) }; }
 function configForPurpose(body = {}, purpose = 'answer') {
   const settings = currentPromptSettings();
   const requested = purpose === 'optimizer' ? settings.optimizerConfigId : (body.configId || settings.answerConfigId);
-  const selected = requested ? modelConfigs.find(config => config.id === requested) : null;
+  const selected = requested ? currentModelConfigs().find(config => config.id === requested) : null;
   if (selected && (selected.purpose === 'both' || selected.purpose === purpose)) return selected;
   return selectModelConfig(body);
 }
 function promptOptimizationInput(body, document, context, learning, kind) {
   const settings = currentPromptSettings();
   const courseId = body.courseId || document?.courseId || document?.course_id || null;
-  const memoryEnabled = db.settings?.memoryEnabled !== false;
+  const memoryEnabled = currentSettings().memoryEnabled !== false;
   const memory = settings.includeMemory && memoryEnabled ? promptOptimizer.retrieveMemories(body.message || '', { courseId, concepts: learning.memory?.concepts || [], weakConcepts: learning.memory?.weakConcepts || [], limit: 8, threshold: Number(settings.relevanceThreshold) || 0.28, enabled: memoryEnabled }) : { selected: [], concepts: [], relatedConcepts: [], relatedQuestions: [], graphRelations: [], weakConcepts: [], profile: null };
   const recentConversation = settings.includeConversation ? learningDb.listConversationMessages(conversationIdFor(body), 8) : [];
   return { originalPrompt: body.message || '请解释当前内容。', kind, queryType: body.queryType, memoryEnabled, selectedText: context.selectedText, language: context.language, context: { ...context, documentTitle: context.documentTitle || document?.title, annotations: learning.annotations || [], notes: learning.notes || [] }, documentContext: settings.includeDocument ? learning.retrieved : [], memories: memory, concepts: settings.includeKnowledge ? memory.concepts : [], weakConcepts: settings.includeKnowledge ? memory.weakConcepts : [], recentConversation: recentConversation.length ? recentConversation : (learning.recentConversation || []) };
@@ -761,7 +778,7 @@ async function importStructuredDocument(payload) {
   const doc = { id: documentId, title: name.replace(/\.[^.]+$/, ''), type: parsed.fileType, fileType: parsed.fileType, size: `${Math.max(1, Math.round(raw.length / 1024))} KB`, pages: pages.length, course: course?.name || payload.course || '未分类', courseId, workspaceId, progress: 0, annotations: 0, questions: 0, uploadedAt: 'Just now', lastRead: 'Not started', tags: ['新上传', ...(parsed.metadata.ocr ? ['OCR'] : [])], content: pages, extraction: extracted?.extraction || 'structured', ocr: extracted?.ocr || parsed.metadata.ocr ? { available: true } : null, sourceFile, metadata: parsed.metadata, structure: { sections: parsed.sections.length, chunks: parsed.chunks.length, parser: 'structured-document-pipeline' } };
   learningDb.upsertDocument({ document: { id: documentId, title: doc.title, fileType: parsed.fileType, sourcePath: sourceFile, createdAt: new Date().toISOString(), metadata: { ...parsed.metadata, courseId, workspaceId }, legacy: doc }, sections: parsed.sections, chunks: parsed.chunks, workspaceId, courseId }); ragService.indexChunks(parsed.chunks); return doc;
 }
-function localAnswer(query, docId, selection = '', language = db.settings?.language === 'en' ? 'en' : 'zh', retrieved = []) {
+function localAnswer(query, docId, selection = '', language = currentSettings().language === 'en' ? 'en' : 'zh', retrieved = []) {
   const hits = retrieved.length ? retrieved.map(item => ({ doc: { id: item.documentId, title: item.documentTitle }, page: item.locator?.page || item.locator?.slide || item.locator?.sheet, heading: item.section || item.citation, text: formatEvidenceText(item.text, findDoc(item.documentId)), score: item.score })) : retrieve(query + ' ' + selection, docId).map(item => ({ ...item, text: formatEvidenceText(item.text, findDoc(item.doc?.id || docId)) })); const refs = citations(hits.length ? hits : retrieve('', docId).slice(0, 2));
   const q = (query + ' ' + selection).toLowerCase(); const english = language === 'en'; let answer = english ? 'Here is the relevant evidence from the current material:' : '我在当前资料中找到的相关证据如下：';
   if ((q.includes('gaussian') || q.includes('高斯') || q.includes('消元')) && (q.includes('unstable') || q.includes('stability') || q.includes('不稳定') || q.includes('稳定'))) answer = english ? 'Gaussian elimination can become numerically unstable when it uses a very small pivot: division by that pivot amplifies round-off error, and subsequent elimination steps can magnify the error further. Partial pivoting swaps in a larger available pivot, reducing this amplification. Keep the concepts separate: the condition number describes sensitivity of the problem itself, while pivoting improves the stability of the algorithm.' : '高斯消元可能出现数值不稳定，常见原因是选到了绝对值很小的主元：除以小主元会放大舍入误差，后续消元还可能继续放大这种误差。部分选主元通过交换行选择更大的可用主元，从而减小误差放大。要区分两件事：条件数描述问题本身对扰动的敏感性，而选主元主要改善算法执行过程的稳定性。';
@@ -807,43 +824,49 @@ function allowAuthAttempt(req, identity = '') { const key = `${req.socket.remote
 function safeAccountSettings(input = {}) { const next = {}; if (input.language !== undefined) next.language = input.language === 'en' || input.language === 'English' ? 'en' : 'zh'; if (input.privacy !== undefined) next.privacy = ['selected-only', 'current-page', 'retrieved-chunks'].includes(input.privacy) ? input.privacy : 'retrieved-chunks'; if (input.retrievalK !== undefined) next.retrievalK = Math.max(1, Math.min(20, Number(input.retrievalK) || 8)); if (input.memoryEnabled !== undefined) next.memoryEnabled = Boolean(input.memoryEnabled); if (input.promptOptimization && typeof input.promptOptimization === 'object') next.promptOptimization = input.promptOptimization; return next; }
 function parsePath(reqUrl) { return new URL(reqUrl, 'http://localhost'); }
 async function api(req, res, url) {
-  const parts = url.pathname.split('/').filter(Boolean); const method = req.method; const auth = authContext(req); learningDb.setUserId(auth.user.id); learningDb.ensureUserSpace(auth.user.id); syncModelConfigs(auth.user.id);
+  const auth = authContext(req);
   const userSettings = auth.guest ? db.settings : learningDb.getUserSettings(auth.user.id);
-  db.settings = { ...db.settings, ...userSettings, memoryEnabled: auth.guest ? false : userSettings?.memoryEnabled !== false, promptOptimization: { ...DEFAULT_PROMPT_SETTINGS, ...(db.settings?.promptOptimization || {}), ...(userSettings?.promptOptimization || {}) } };
+  const settings = { ...db.settings, ...userSettings, memoryEnabled: auth.guest ? false : userSettings?.memoryEnabled !== false, promptOptimization: { ...DEFAULT_PROMPT_SETTINGS, ...(db.settings?.promptOptimization || {}), ...(userSettings?.promptOptimization || {}) } };
+  const configs = modelStoreFor(auth.user.id).read();
+  return learningDb.runAsUser(auth.user.id, () => requestSettingsContext.run({ value: settings }, () => requestModelConfigContext.run({ configs }, () => apiForUser(req, res, url, auth))));
+}
+async function apiForUser(req, res, url, auth) {
+  const parts = url.pathname.split('/').filter(Boolean); const method = req.method; learningDb.ensureUserSpace(auth.user.id); 
   if (['POST', 'PATCH', 'DELETE'].includes(method) && !sameOrigin(req)) return error(res, 'CSRF_ORIGIN_REJECTED', '写请求必须来自当前 StudyAgent 地址。', { status: 403 });
+  if (method === 'POST' && url.pathname === '/api/guest/cleanup') { if (!auth.guest) return error(res, 'GUEST_CLEANUP_FORBIDDEN', '登录状态下不清理账号数据。', { status: 403 }); resetGuestWorkspace(); return json(res, 200, { ok: true }); }
   if (method === 'GET' && url.pathname === '/api/auth/session') return json(res, 200, { authenticated: !auth.guest, guest: auth.guest, user: auth.user, expiresAt: auth.session?.expiresAt || null });
-  if (method === 'POST' && url.pathname === '/api/auth/register') { const input = await body(req); if (!allowAuthAttempt(req, input.email)) return error(res, 'AUTH_RATE_LIMITED', '尝试次数过多，请稍后再试。', { status: 429 }); try { const result = authService.register(input); setSessionCookie(res, result.session.id); learningDb.setUserId(result.user.id); return json(res, 201, { authenticated: true, guest: false, user: result.user, expiresAt: result.session.expiresAt }); } catch (e) { return error(res, e.code || 'REGISTER_FAILED', e.message, { status: e.status || 400 }); } }
-  if (method === 'POST' && url.pathname === '/api/auth/login') { const input = await body(req); if (!allowAuthAttempt(req, input.email)) return error(res, 'AUTH_RATE_LIMITED', '尝试次数过多，请稍后再试。', { status: 429 }); try { const result = authService.login(input); setSessionCookie(res, result.session.id); learningDb.setUserId(result.user.id); return json(res, 200, { authenticated: true, guest: false, user: result.user, expiresAt: result.session.expiresAt }); } catch (e) { return error(res, e.code || 'LOGIN_FAILED', e.message, { status: e.status || 401 }); } }
-  if (method === 'POST' && url.pathname === '/api/auth/logout') { if (auth.session?.id) learningDb.deleteSession(auth.session.id); clearSessionCookie(res); learningDb.setUserId('user-local'); return json(res, 200, { authenticated: false, guest: true, user: guestUser() }); }
+  if (method === 'POST' && url.pathname === '/api/auth/register') { const input = await body(req); if (!allowAuthAttempt(req, input.email)) return error(res, 'AUTH_RATE_LIMITED', '尝试次数过多，请稍后再试。', { status: 429 }); try { const result = authService.register(input); resetGuestWorkspace(); setSessionCookie(res, result.session.id); return json(res, 201, { authenticated: true, guest: false, user: result.user, expiresAt: result.session.expiresAt }); } catch (e) { return error(res, e.code || 'REGISTER_FAILED', e.message, { status: e.status || 400 }); } }
+  if (method === 'POST' && url.pathname === '/api/auth/login') { const input = await body(req); if (!allowAuthAttempt(req, input.email)) return error(res, 'AUTH_RATE_LIMITED', '尝试次数过多，请稍后再试。', { status: 429 }); try { const result = authService.login(input); resetGuestWorkspace(); setSessionCookie(res, result.session.id); return json(res, 200, { authenticated: true, guest: false, user: result.user, expiresAt: result.session.expiresAt }); } catch (e) { return error(res, e.code || 'LOGIN_FAILED', e.message, { status: e.status || 401 }); } }
+  if (method === 'POST' && url.pathname === '/api/auth/logout') { if (auth.session?.id) learningDb.deleteSession(auth.session.id); clearSessionCookie(res); return json(res, 200, { authenticated: false, guest: true, user: guestUser() }); }
   if (method === 'GET' && url.pathname === '/api/account') { if (auth.guest) return error(res, 'AUTH_REQUIRED', '请先登录个人账号。', { status: 401 }); return json(res, 200, { user: learningDb.getUserById(auth.user.id), settings: learningDb.getUserSettings(auth.user.id) }); }
   if (method === 'PATCH' && url.pathname === '/api/account') { if (auth.guest) return error(res, 'AUTH_REQUIRED', '请先登录个人账号。', { status: 401 }); const input = await body(req); try { return json(res, 200, { user: learningDb.updateUserAccount(auth.user.id, { username: input.username, avatarUrl: input.avatarUrl }) }); } catch (e) { return error(res, 'ACCOUNT_UPDATE_FAILED', e.message, { status: 400 }); } }
   if (method === 'POST' && url.pathname === '/api/account/password') { if (auth.guest) return error(res, 'AUTH_REQUIRED', '请先登录个人账号。', { status: 401 }); const input = await body(req); const account = learningDb.getUserAuthByEmail(auth.user.email); if (!account || !authService.verifyPassword(String(input.currentPassword || ''), account.passwordHash)) return error(res, 'INVALID_CURRENT_PASSWORD', '当前密码不正确。', { status: 401 }); try { authService.validateCredentials({ email: auth.user.email, password: input.newPassword }); learningDb.updateUserPassword(auth.user.id, authService.hashPassword(input.newPassword)); return json(res, 200, { ok: true }); } catch (e) { return error(res, e.code || 'PASSWORD_UPDATE_FAILED', e.message, { status: e.status || 400 }); } }
-  if (method === 'GET' && url.pathname === '/api/account/settings') { if (auth.guest) return json(res, 200, { guest: true, settings: db.settings || {} }); return json(res, 200, { guest: false, settings: learningDb.getUserSettings(auth.user.id) }); }
+  if (method === 'GET' && url.pathname === '/api/account/settings') { if (auth.guest) return json(res, 200, { guest: true, settings: currentSettings() }); return json(res, 200, { guest: false, settings: learningDb.getUserSettings(auth.user.id) }); }
   if (method === 'POST' && url.pathname === '/api/account/settings') { if (auth.guest) return error(res, 'AUTH_REQUIRED', '登录后才能保存个人账号设置。', { status: 401 }); const input = await body(req); return json(res, 200, { settings: learningDb.saveUserSettings(safeAccountSettings(input), auth.user.id) }); }
-  if (method === 'DELETE' && url.pathname === '/api/account') { if (auth.guest) return error(res, 'AUTH_REQUIRED', '请先登录个人账号。', { status: 401 }); const input = await body(req); if (String(input.confirmation || '') !== 'DELETE') return error(res, 'DELETE_CONFIRMATION_REQUIRED', '请输入 DELETE 确认删除账号。', { status: 400 }); const ownedFiles = learningDb.listDocuments().map(item => item.source_path || item.sourceFile).filter(Boolean); const result = learningDb.deleteUserAccount(auth.user.id); for (const sourceFile of ownedFiles) { const targetPath = path.join(UPLOAD_DIR, path.basename(sourceFile)); if (fs.existsSync(targetPath)) fs.rmSync(targetPath, { force: true }); } clearSessionCookie(res); learningDb.setUserId('user-local'); return json(res, 200, result); }
+  if (method === 'DELETE' && url.pathname === '/api/account') { if (auth.guest) return error(res, 'AUTH_REQUIRED', '请先登录个人账号。', { status: 401 }); const input = await body(req); if (String(input.confirmation || '') !== 'DELETE') return error(res, 'DELETE_CONFIRMATION_REQUIRED', '请输入 DELETE 确认删除账号。', { status: 400 }); const ownedFiles = learningDb.listDocuments().map(item => item.source_path || item.sourceFile).filter(Boolean); const result = learningDb.deleteUserAccount(auth.user.id); for (const sourceFile of ownedFiles) { const targetPath = path.join(UPLOAD_DIR, path.basename(sourceFile)); if (fs.existsSync(targetPath)) fs.rmSync(targetPath, { force: true }); } clearSessionCookie(res); return json(res, 200, result); }
   if (method === 'GET' && url.pathname === '/api/ocr/status') return json(res, 200, { available: ocrAvailable(), engine: ocrAvailable() ? 'tesseract.js' : null, language: ocrAvailable() ? 'chi_sim' : null, renderer: findPdftoppm() ? 'pdftoppm' : null });
   if (method === 'GET' && url.pathname === '/api/parser/status') return json(res, 200, { ...parserStatus(), legacyOffice: await legacyOfficeStatus() });
-  if (method === 'POST' && url.pathname === '/api/agent/plan') { const b = await body(req); const document = findDoc(b.documentId); const scopedBody = { ...b, memoryEnabled: db.settings?.memoryEnabled !== false }; return json(res, 200, learningOrchestrator.prepare({ question: b.message || '', body: scopedBody, document, kind: b.kind || 'text', scope: learningScope(b, document) })); }
+  if (method === 'POST' && url.pathname === '/api/agent/plan') { const b = await body(req); const document = findDoc(b.documentId); const scopedBody = { ...b, memoryEnabled: currentSettings().memoryEnabled !== false }; return json(res, 200, learningOrchestrator.prepare({ question: b.message || '', body: scopedBody, document, kind: b.kind || 'text', scope: learningScope(b, document) })); }
   if (method === 'GET' && url.pathname === '/api/models/providers') return json(res, 200, { providers: publicProviders() });
-  if (method === 'GET' && url.pathname === '/api/models/configs') return json(res, 200, { configs: modelConfigs.map(publicModelConfig), defaultId: defaultModelConfig()?.id || null });
+  if (method === 'GET' && url.pathname === '/api/models/configs') return json(res, 200, { configs: currentModelConfigs().map(publicModelConfig), defaultId: defaultModelConfig()?.id || null });
   if (method === 'POST' && url.pathname === '/api/models/configs') {
-    const input = await body(req); const previous = input.id ? modelConfigs.find(config => config.id === input.id) : null;
+    const input = await body(req); const previous = input.id ? currentModelConfigs().find(config => config.id === input.id) : null;
     const config = normalizeModelConfig(input, previous || {});
     if (!config.provider || !config.model) return error(res, 'INVALID_MODEL_CONFIG', 'Provider 和 Model 不能为空');
-    if (config.isDefault) modelConfigs = modelConfigs.map(item => ({ ...item, isDefault: false }));
-    const index = modelConfigs.findIndex(item => item.id === config.id); if (index >= 0) modelConfigs[index] = config; else modelConfigs.push(config);
+    if (config.isDefault) replaceModelConfigs(currentModelConfigs().map(item => ({ ...item, isDefault: false })));
+    const index = currentModelConfigs().findIndex(item => item.id === config.id); if (index >= 0) replaceModelConfigs(currentModelConfigs().map((item, itemIndex) => itemIndex === index ? config : item)); else replaceModelConfigs([...currentModelConfigs(), config]);
     persistModelConfigs(); return json(res, 200, publicModelConfig(config));
   }
   if (method === 'DELETE' && parts[0] === 'api' && parts[1] === 'models' && parts[2] === 'configs' && parts[3]) {
-    modelConfigs = modelConfigs.filter(config => config.id !== parts[3]); persistModelConfigs(); return json(res, 200, { ok: true });
+    replaceModelConfigs(currentModelConfigs().filter(config => config.id !== parts[3])); persistModelConfigs(); return json(res, 200, { ok: true });
   }
   if (method === 'POST' && parts[0] === 'api' && parts[1] === 'models' && parts[2] === 'configs' && parts[4] === 'test') {
-    const config = modelConfigs.find(item => item.id === parts[3]); if (!config) return error(res, 'MODEL_CONFIG_NOT_FOUND', '模型配置不存在');
+    const config = currentModelConfigs().find(item => item.id === parts[3]); if (!config) return error(res, 'MODEL_CONFIG_NOT_FOUND', '模型配置不存在');
     if (!canUseModelConfig(config)) return json(res, 200, { ok: false, error: { code: 'API_KEY_REQUIRED', message: '当前模型配置不可用；远程服务需要 API Key，Ollama 可免 Key 使用。' } });
     try { return json(res, 200, { ...(await createProvider(config).testConnection()), ok: true }); } catch (e) { return json(res, e.status || 200, { ok: false, error: { code: e.code || 'CONNECTION_FAILED', message: safeMessage(e, '连接模型服务失败') } }); }
   }
   if (method === 'POST' && url.pathname === '/api/models/discover') {
-    const input = await body(req); const previous = input.id ? modelConfigs.find(item => item.id === input.id) : null; const config = normalizeModelConfig(input, previous || {});
+    const input = await body(req); const previous = input.id ? currentModelConfigs().find(item => item.id === input.id) : null; const config = normalizeModelConfig(input, previous || {});
     if (!canUseModelConfig(config)) return error(res, 'API_KEY_REQUIRED', '刷新模型列表前请先填写 API Key；Ollama 本地服务可免 Key 使用');
     try { const models = await createProvider(config).listModels(); modelListCache.set(config.provider, models); return json(res, 200, { models, source: 'remote' }); } catch (e) { return json(res, 200, { models: fallbackModels(config.provider), source: 'fallback', error: { code: e.code || 'MODEL_LIST_FAILED', message: safeMessage(e, '动态模型列表获取失败，已使用本地列表') } }); }
   }
@@ -874,12 +897,10 @@ async function api(req, res, url) {
     const b = await body(req);
     try {
       const updated = learningDb.updateDocumentOrganization(parts[3], { workspaceId: b.workspaceId, courseId: Object.prototype.hasOwnProperty.call(b, 'courseId') ? b.courseId : undefined });
-      db.documents = db.documents.map(document => document.id === parts[3] ? { ...document, ...updated.legacy, courseId: updated.course_id, workspaceId: updated.workspace_id, course: updated.legacy?.course || '未分类' } : document);
-      save();
       return json(res, 200, clientDocumentView(updated));
     } catch (e) { return error(res, e.code || 'DOCUMENT_ORGANIZATION_FAILED', e.message, { status: 400 }); }
   }
-  if (method === 'DELETE' && parts[0] === 'api' && parts[1] === 'learning' && parts[2] === 'documents' && parts[3]) { const target = findDoc(parts[3]); const removed = learningDb.deleteDocument(parts[3]); if (target?.sourceFile) { const targetPath = path.join(UPLOAD_DIR, target.sourceFile); if (fs.existsSync(targetPath)) fs.rmSync(targetPath, { force: true }); } if (removed) { db.documents = db.documents.filter(document => document.id !== parts[3]); save(); } return json(res, 200, { ok: removed, id: parts[3] }); }
+  if (method === 'DELETE' && parts[0] === 'api' && parts[1] === 'learning' && parts[2] === 'documents' && parts[3]) { const target = findDoc(parts[3]); const removed = learningDb.deleteDocument(parts[3]); if (target?.sourceFile) { const targetPath = path.join(UPLOAD_DIR, target.sourceFile); if (fs.existsSync(targetPath)) fs.rmSync(targetPath, { force: true }); } return json(res, 200, { ok: removed, id: parts[3] }); }
   if (method === 'GET' && url.pathname === '/api/learning/search') { const query = url.searchParams.get('q') || ''; const scope = url.searchParams.get('scope') || 'workspace'; const documentIds = (url.searchParams.get('documentIds') || '').split(',').map(value => value.trim()).filter(Boolean); const page = Number(url.searchParams.get('page') || 0) || undefined; const slide = Number(url.searchParams.get('slide') || 0) || undefined; const sheet = url.searchParams.get('sheet') || undefined; const options = { page, slide, sheet, limit: Number(url.searchParams.get('limit') || 10) }; if (scope === 'course') options.courseId = url.searchParams.get('courseId') || '__empty-course__'; else if (scope === 'documents' || scope === 'current-document' || scope === 'current-page') options.documentIds = documentIds.length ? documentIds : ['__empty-document-selection__']; else options.workspaceId = url.searchParams.get('workspaceId') || learningDb.defaultWorkspaceId(); return json(res, 200, { query, scope, results: ragService.context(query, options) }); }
   if (method === 'GET' && url.pathname === '/api/memory') return json(res, 200, { profile: learningDb.getUserProfile(), memories: learningDb.listMemories({ type: url.searchParams.get('type') || undefined, courseId: url.searchParams.get('courseId') || undefined, limit: Number(url.searchParams.get('limit') || 100) }), concepts: learningDb.listConcepts(url.searchParams.get('courseId') || undefined), questions: learningDb.listQuestions({ courseId: url.searchParams.get('courseId') || undefined, limit: Number(url.searchParams.get('questionLimit') || 50) }), errors: learningDb.listErrors({ courseId: url.searchParams.get('courseId') || undefined, limit: Number(url.searchParams.get('errorLimit') || 50) }) });
   if (method === 'GET' && url.pathname === '/api/memory/profile') return json(res, 200, { profile: learningDb.getUserProfile() });
@@ -975,7 +996,7 @@ async function api(req, res, url) {
     if (input.relevanceThreshold !== undefined) next.relevanceThreshold = Math.max(0, Math.min(1, Number(input.relevanceThreshold) || DEFAULT_PROMPT_SETTINGS.relevanceThreshold));
     if (!OPTIMIZATION_LEVELS.includes(next.level)) next.level = DEFAULT_PROMPT_SETTINGS.level;
     if (!ANSWER_MODES.includes(next.answerMode)) next.answerMode = DEFAULT_PROMPT_SETTINGS.answerMode;
-    db.settings = { ...db.settings, promptOptimization: next }; if (auth.guest) save(); else learningDb.saveUserSettings({ promptOptimization: next }, auth.user.id); return json(res, 200, { settings: next });
+    requestSettingsContext.getStore().value = { ...currentSettings(), promptOptimization: next }; if (!auth.guest) learningDb.saveUserSettings({ promptOptimization: next }, auth.user.id); return json(res, 200, { settings: next });
   }
   if (method === 'POST' && url.pathname === '/api/prompt/optimize') {
     const b = await body(req); b.message = String(b.message || '请解释当前内容。');
@@ -987,10 +1008,10 @@ async function api(req, res, url) {
     try {
       const result = await runAiRequest(b, b.formula ? 'formula' : 'text');
       const conversationId = conversationIdFor(b);
-      result.memory = memoryService.recordInteraction({ question: b.message, answer: result.answer, courseId: b.courseId || findDoc(b.documentId)?.courseId || null, documentId: b.documentId, conversationId, optedOut: b.remember === false || db.settings?.memoryEnabled === false });
+      result.memory = memoryService.recordInteraction({ question: b.message, answer: result.answer, courseId: b.courseId || findDoc(b.documentId)?.courseId || null, documentId: b.documentId, conversationId, optedOut: b.remember === false || currentSettings().memoryEnabled === false });
       result.conversationId = persistConversationTurn(b, result, result.answer);
       if (b.sessionId) { const session = learningDb.getLearningSession(b.sessionId); if (session) learningDb.updateLearningSession(b.sessionId, { pagesViewed: b.page ? [b.page] : [], conceptsViewed: result.memory?.concepts || [], questionsAsked: session.questionsAsked + 1 }); }
-      db.messages.push({ id: uid('msg'), role: 'user', text: b.message, selectedText: b.selectedText || '', formula: b.formula || '', pageNumber: b.page, provider: result.provider, model: result.model, createdAt: new Date().toISOString() }, { id: uid('msg'), role: 'assistant', text: result.answer, citations: result.citations, provider: result.provider, model: result.model, mode: result.mode, createdAt: new Date().toISOString() }); save(); return json(res, 200, result);
+      return json(res, 200, result);
     } catch (e) { return error(res, e.code || 'AI_REQUEST_FAILED', safeMessage(e, 'AI 请求失败'), { provider: b.provider || null, status: e.status || 502 }); }
   }
   if (method === 'POST' && url.pathname === '/api/chat/stream') {
@@ -998,11 +1019,11 @@ async function api(req, res, url) {
     res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
     try {
       if (!canUseModelConfig(config)) {
-        const document = findDoc(b.documentId); const context = readerContext(b, document); const learning = buildLearningContext(b, document); const promptOptimization = await optimizeForRequest(b, document, context, learning, b.formula ? 'formula' : 'text'); const language = b.language === 'en' ? 'en' : (db.settings?.language === 'en' ? 'en' : 'zh'); const result = localAnswer(b.message, b.documentId, b.selectedText || '', language, learning.retrieved);
+        const document = findDoc(b.documentId); const context = readerContext(b, document); const learning = buildLearningContext(b, document); const promptOptimization = await optimizeForRequest(b, document, context, learning, b.formula ? 'formula' : 'text'); const language = b.language === 'en' ? 'en' : (currentSettings().language === 'en' ? 'en' : 'zh'); const result = localAnswer(b.message, b.documentId, b.selectedText || '', language, learning.retrieved);
         const memoryNote = memoryAssociationNote(learning.memory, language);
         result.answer += memoryNote;
         const conversationId = conversationIdFor(b);
-        const memory = memoryService.recordInteraction({ question: b.message, answer: result.answer, courseId: b.courseId || findDoc(b.documentId)?.courseId || null, documentId: b.documentId, conversationId, optedOut: b.remember === false || db.settings?.memoryEnabled === false });
+        const memory = memoryService.recordInteraction({ question: b.message, answer: result.answer, courseId: b.courseId || findDoc(b.documentId)?.courseId || null, documentId: b.documentId, conversationId, optedOut: b.remember === false || currentSettings().memoryEnabled === false });
         persistConversationTurn(b, result, result.answer);
         if (b.sessionId) { const session = learningDb.getLearningSession(b.sessionId); if (session) learningDb.updateLearningSession(b.sessionId, { pagesViewed: b.page ? [b.page] : [], conceptsViewed: memory?.concepts || [], questionsAsked: session.questionsAsked + 1 }); }
         for (const chunk of result.answer.split(/(?<=[。！？.!?])|\n/).filter(Boolean)) { res.write(`data: ${JSON.stringify({ delta: chunk, mode: 'local', provider: 'local', model: 'Evidence-first local mode', language: result.language })}\n\n`); await new Promise(resolve => setTimeout(resolve, 35)); }
@@ -1012,20 +1033,20 @@ async function api(req, res, url) {
       await createProvider(config).streamChat({ model: config.model, messages: [{ role: 'system', content: `You are StudyAgent's literature reading assistant. Answer in ${context.language === 'en' ? 'English' : 'Chinese'}. Ground the answer in the supplied context and use LaTeX for mathematics.` }, { role: 'user', content: prompt }], temperature: config.temperature, maxTokens: config.maxTokens }, token => { answer += token; res.write(`data: ${JSON.stringify({ delta: token, mode: 'remote', provider: config.provider, model: config.model, language: context.language })}\n\n`); });
       const citations = learning.retrieved.map((item, index) => ({ id: index + 1, documentId: item.documentId, document: item.documentTitle, page: item.locator.page, slide: item.locator.slide, sheet: item.locator.sheet, section: item.section, label: item.citation, quote: item.text.slice(0, 130) }));
       const conversationId = conversationIdFor(b);
-      const memory = memoryService.recordInteraction({ question: b.message, answer, courseId: b.courseId || document?.courseId || document?.course_id || null, documentId: b.documentId, conversationId, optedOut: b.remember === false || db.settings?.memoryEnabled === false });
+      const memory = memoryService.recordInteraction({ question: b.message, answer, courseId: b.courseId || document?.courseId || document?.course_id || null, documentId: b.documentId, conversationId, optedOut: b.remember === false || currentSettings().memoryEnabled === false });
       persistConversationTurn(b, { citations, provider: config.provider, model: config.model, mode: 'remote', promptOptimization }, answer);
       if (b.sessionId) { const session = learningDb.getLearningSession(b.sessionId); if (session) learningDb.updateLearningSession(b.sessionId, { pagesViewed: b.page ? [b.page] : [], questionsAsked: session.questionsAsked + 1 }); }
-      db.messages.push({ id: uid('msg'), role: 'user', text: b.message, selectedText: b.selectedText || '', pageNumber: b.page, provider: config.provider, model: config.model, createdAt: new Date().toISOString() }, { id: uid('msg'), role: 'assistant', text: answer, citations, provider: config.provider, model: config.model, mode: 'remote', createdAt: new Date().toISOString() }); save(); res.write(`data: ${JSON.stringify({ done: true, conversationId, citations, memory, promptOptimization, mode: 'remote', provider: config.provider, model: config.model, language: context.language })}\n\n`); return res.end();
+      res.write(`data: ${JSON.stringify({ done: true, conversationId, citations, memory, promptOptimization, mode: 'remote', provider: config.provider, model: config.model, language: context.language })}\n\n`); return res.end();
     } catch (e) { res.write(`data: ${JSON.stringify({ error: { code: e.code || 'AI_REQUEST_FAILED', message: safeMessage(e, 'AI 请求失败') } })}\n\n`); return res.end(); }
   }
   if (method === 'POST' && url.pathname === '/api/ai/embed') { const b = await body(req); const config = selectModelConfig(b); if (!canUseModelConfig(config)) return error(res, 'REMOTE_MODEL_REQUIRED', 'Embedding 需要先在设置中配置远程模型', { status: 503 }); try { return json(res, 200, await createProvider(config).embed({ input: b.input, model: b.model })); } catch (e) { return error(res, e.code || 'EMBEDDING_FAILED', safeMessage(e, 'Embedding 请求失败'), { status: e.status || 502 }); } }
   if (method === 'POST' && url.pathname === '/api/ai/vision') { const b = await body(req); const config = selectModelConfig(b); if (!canUseModelConfig(config)) return error(res, 'REMOTE_MODEL_REQUIRED', 'Vision 需要先在设置中配置支持视觉的远程模型', { status: 503 }); try { return json(res, 200, await createProvider(config).vision({ imageData: b.imageData, imageUrl: b.imageUrl, prompt: b.prompt, model: b.model })); } catch (e) { return error(res, e.code || 'VISION_FAILED', safeMessage(e, 'Vision 请求失败'), { status: e.status || 502 }); } }
   if (method === 'POST' && url.pathname === '/api/ai/explain') { const b = await body(req); b.message = b.message || `请解释这段内容：${b.selectedText || ''}`; try { return json(res, 200, await runAiRequest(b, b.formula ? 'formula' : 'text')); } catch (e) { return error(res, e.code || 'AI_REQUEST_FAILED', safeMessage(e, 'AI 解释失败'), { status: e.status || 502 }); } }
-  if (method === 'POST' && url.pathname === '/api/ai/summarize') { const b = await body(req); const d = findDoc(b.documentId) || db.documents[0]; const pages = b.page ? d.content.filter(p => p.page === Number(b.page)) : d.content; const context = pages.map(page => page.text).join('\n\n').slice(0, 5000); try { return json(res, 200, await runAiRequest({ ...b, documentId: d.id, selectedText: context, message: b.message || '请总结当前页面的核心内容、关键概念、公式和复习重点。' }, 'summary')); } catch (e) { return error(res, e.code || 'AI_REQUEST_FAILED', safeMessage(e, 'AI 总结失败'), { status: e.status || 502 }); } }
-  if (method === 'POST' && url.pathname === '/api/ai/create-card') { const b = await body(req); const d = findDoc(b.documentId) || db.documents[0]; if (!d) return error(res, 'DOCUMENT_REQUIRED', '创建知识卡需要至少一份资料'); const language = b.language === 'en' ? 'en' : (db.settings?.language === 'en' ? 'en' : 'zh'); const formula = String(b.formula || ''); const selected = formula ? `${b.selectedText || ''}\n\\(${formula}\\)` : (b.selectedText || ''); const card = learningDb.saveCard({ front: selected ? `Explain: ${selected.slice(0, 120)}` : 'What is the key idea of this section?', back: localAnswer('Explain ' + (selected || 'the main idea'), d.id, selected, language).answer, source: `${d.title} · p.${b.page || 1}`, due: 'Tomorrow', mastery: 0.2, documentId: d.id, courseId: d.courseId || d.course_id || null, locator: { page: Number(b.page || 1) || 1, selectedText: String(b.selectedText || '').slice(0, 500), formulaLatex: formula } }); return json(res, 201, card); }
+  if (method === 'POST' && url.pathname === '/api/ai/summarize') { const b = await body(req); const d = findDoc(b.documentId) || learningDb.listDocuments()[0]; if (!d) return error(res, 'DOCUMENT_REQUIRED', '请先添加一份资料' ); const pages = b.page ? d.content.filter(p => p.page === Number(b.page)) : d.content; const context = pages.map(page => page.text).join('\n\n').slice(0, 5000); try { return json(res, 200, await runAiRequest({ ...b, documentId: d.id, selectedText: context, message: b.message || '请总结当前页面的核心内容、关键概念、公式和复习重点。' }, 'summary')); } catch (e) { return error(res, e.code || 'AI_REQUEST_FAILED', safeMessage(e, 'AI 总结失败'), { status: e.status || 502 }); } }
+  if (method === 'POST' && url.pathname === '/api/ai/create-card') { const b = await body(req); const d = findDoc(b.documentId) || learningDb.listDocuments()[0]; if (!d) return error(res, 'DOCUMENT_REQUIRED', '创建知识卡需要至少一份资料'); const language = b.language === 'en' ? 'en' : (currentSettings().language === 'en' ? 'en' : 'zh'); const formula = String(b.formula || ''); const selected = formula ? `${b.selectedText || ''}\n\\(${formula}\\)` : (b.selectedText || ''); const card = learningDb.saveCard({ front: selected ? `Explain: ${selected.slice(0, 120)}` : 'What is the key idea of this section?', back: localAnswer('Explain ' + (selected || 'the main idea'), d.id, selected, language).answer, source: `${d.title} · p.${b.page || 1}`, due: 'Tomorrow', mastery: 0.2, documentId: d.id, courseId: d.courseId || d.course_id || null, locator: { page: Number(b.page || 1) || 1, selectedText: String(b.selectedText || '').slice(0, 500), formulaLatex: formula } }); return json(res, 201, card); }
   if (method === 'POST' && url.pathname === '/api/review/complete') { const b = await body(req); const scheduled = learningDb.listReviewSchedule({ limit: 200 }).find(item => `learning-review-${item.concept_id}` === b.id); if (!scheduled) return json(res, 200, { ok: false, task: null, knowledge: null, review: null }); const review = memoryService.recordReview({ concept: scheduled.concept_name, courseId: scheduled.course_id || null, correct: b.correct !== false }); const knowledge = learningDb.listKnowledgePoints(scheduled.course_id || undefined).find(item => item.name === scheduled.concept_name) || null; return json(res, 200, { ok: true, task: { id: b.id, title: `Review ${scheduled.concept_name}`, status: 'completed', conceptId: scheduled.concept_id }, knowledge, review }); }
-  if (method === 'GET' && url.pathname === '/api/state') return json(res, 200, { ...db, documents: learningDb.listDocuments().map(clientDocumentView), knowledge: learningDb.listKnowledgePoints(), cards: learningDb.listCards({ limit: 200 }), messages: [] });
-  if (method === 'POST' && url.pathname === '/api/settings') { const b = await body(req); const safe = safeAccountSettings(b); db.settings = { ...db.settings, ...safe }; if (auth.guest) save(); else learningDb.saveUserSettings(safe, auth.user.id); return json(res, 200, db.settings); }
+  if (method === 'GET' && url.pathname === '/api/state') return json(res, 200, { settings: currentSettings(), documents: learningDb.listDocuments().map(clientDocumentView), knowledge: learningDb.listKnowledgePoints(), cards: learningDb.listCards({ limit: 200 }), messages: [] });
+  if (method === 'POST' && url.pathname === '/api/settings') { const b = await body(req); const safe = safeAccountSettings(b); requestSettingsContext.getStore().value = { ...currentSettings(), ...safe }; if (!auth.guest) learningDb.saveUserSettings(safe, auth.user.id); return json(res, 200, currentSettings()); }
   return error(res, 'NOT_FOUND', 'API route not found');
 }
 
