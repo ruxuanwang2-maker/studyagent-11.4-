@@ -455,7 +455,46 @@ function buildLearningArtifacts(sessionId) {
   const experience = learningDb.saveLearningExperience({ courseId: session.courseId, documentId: session.documentId, sessionId, date: endedAt.slice(0, 10), title: concepts.length ? `学习 ${concepts.slice(0, 3).join('、')}` : '完成一次讲义学习', content: summary, concepts, focus: importantPoints, questionsCount: questions.length, difficultPoints, masteryChanges: learningDb.listProgress({ courseId: session.courseId || undefined, limit: 100 }).filter(item => concepts.includes(item.concept_name)).map(item => ({ concept: item.concept_name, event: item.last_event, updatedAt: item.updated_at })), relatedConcepts: learningDb.listGraph(session.courseId || undefined).edges.filter(edge => concepts.includes(edge.sourceLabel) || concepts.includes(edge.targetLabel)).slice(0, 20), rawEvidence, interpretation });
   return { session: finished, note, experience };
 }
-  function learningQuiz({ courseId = null, concept = '', count = 6, language = 'zh' } = {}) { const en = language === 'en'; const requested = String(concept || '').trim(); const concepts = learningDb.listConcepts(courseId); const fallback = concepts.find(item => learningDb.getMasteryEvidence(item.id).learningStatus === 'needs_attention')?.name || concepts[0]?.name || (en ? 'the current material' : '当前资料'); const topic = requested || fallback; const requestedCount = Math.max(4, Math.min(8, Number(count) || 6)); const retrieved = ragService.context(topic, { courseId, limit: Math.max(requestedCount * 3, 18) }); const unique = []; const seen = new Set(); for (const item of retrieved) { const key = `${item.documentId}:${item.locator?.page || item.locator?.slide || item.locator?.sheet || item.section}:${item.text.slice(0, 80)}`; if (!seen.has(key)) { seen.add(key); unique.push(item); } if (unique.length >= requestedCount) break; } const variants = en ? [ ['concept', 'Concept explanation', item => `According to ${item.citation}, explain the core idea of “${topic}” and its role in this material.`], ['formula', 'Formula recognition', item => `Identify the mathematical expression or notation in ${item.citation}, rewrite it in LaTeX if applicable, and explain each important symbol.`], ['comparison', 'Comparison and distinction', item => `Compare the idea in ${item.citation} with a closely related method or concept. State one important difference.`], ['application', 'Application reasoning', item => `Suppose you need to apply “${topic}” in a new problem. What decision or steps should you take based on ${item.citation}?`], ['diagnosis', 'Error diagnosis', item => `What misunderstanding or numerical mistake could happen when reading ${item.citation}, and how would you detect or correct it?`], ['evidence', 'Evidence summary', item => `Summarize the evidence in ${item.citation} in two or three sentences, keeping the key condition, result, or limitation.`] ] : [ ['concept', '概念解释', item => `根据${item.citation}，解释“${topic}”的核心含义，并说明它在这段资料中的作用。`], ['formula', '公式识别', item => `请识别${item.citation}中的数学表达式或符号；如果包含公式，请用 LaTeX 重写，并解释关键符号。`], ['comparison', '比较辨析', item => `请将${item.citation}中的“${topic}”与一个相关方法或概念进行比较，说明至少一个关键区别。`], ['application', '应用推理', item => `如果在新问题中使用“${topic}”，根据${item.citation}应采取哪些步骤或判断？请说明理由。`], ['diagnosis', '错误诊断', item => `阅读${item.citation}时可能出现什么理解或数值计算错误？请给出发现和纠正方法。`], ['evidence', '证据概括', item => `请用两三句话概括${item.citation}中的关键条件、结论或限制，并保留重要细节。` ] ]; return { topic, mode: 'retrieval-grounded-local', items: unique.map((item, index) => { const [type, typeLabel, question] = variants[index % variants.length]; return { id: `quiz-${Date.now()}-${index}`, type, typeLabel, question: question(item), answer: formatEvidenceText(item.text, findDoc(item.documentId)), citation: item.citation, documentId: item.documentId, locator: item.locator }; }) }; }
+  function learningQuiz({ courseId = null, concept = '', count = 6, language = 'zh' } = {}) {
+    const en = language === 'en';
+    const requested = String(concept || '').trim();
+    const concepts = learningDb.listConcepts(courseId);
+    const courseName = learningDb.getCourse(courseId)?.name || '';
+    const courseDocuments = courseId ? learningDb.listDocuments({ courseId }).map(item => item.title).filter(Boolean) : [];
+    const fallback = concepts.find(item => learningDb.getMasteryEvidence(item.id).learningStatus === 'needs_attention')?.name || concepts[0]?.name || [courseName, ...courseDocuments.slice(0, 3)].filter(Boolean).join(' ') || (en ? 'the current material' : '当前资料');
+    const topic = requested || fallback;
+    const requestedCount = Math.max(4, Math.min(8, Number(count) || 6));
+    const retrieved = ragService.context(topic, { courseId, limit: Math.max(requestedCount * 3, 18) });
+    const unique = [];
+    const seen = new Set();
+    for (const item of retrieved) {
+      const key = `${item.documentId}:${item.locator?.page || item.locator?.slide || item.locator?.sheet || item.section}:${item.text.slice(0, 80)}`;
+      if (!seen.has(key)) { seen.add(key); unique.push(item); }
+      if (unique.length >= requestedCount) break;
+    }
+    const variants = en ? [
+      ['concept', 'Concept explanation', item => `According to ${item.citation}, explain the core idea of “${topic}” and its role in this material.`],
+      ['formula', 'Formula recognition', item => `Identify the mathematical expression or notation in ${item.citation}, rewrite it in LaTeX if applicable, and explain each important symbol.`],
+      ['comparison', 'Comparison and distinction', item => `Compare the idea in ${item.citation} with a closely related method or concept. State one important difference.`],
+      ['application', 'Application reasoning', item => `Suppose you need to apply “${topic}” in a new problem. What decision or steps should you take based on ${item.citation}?`],
+      ['diagnosis', 'Error diagnosis', item => `What misunderstanding or numerical mistake could happen when reading ${item.citation}, and how would you detect or correct it?`],
+      ['evidence', 'Evidence summary', item => `Summarize the evidence in ${item.citation} in two or three sentences, keeping the key condition, result, or limitation.`]
+    ] : [
+      ['concept', '概念解释', item => `根据${item.citation}，解释“${topic}”的核心含义，并说明它在这段资料中的作用。`],
+      ['formula', '公式识别', item => `请识别${item.citation}中的数学表达式或符号；如果包含公式，请用 LaTeX 重写，并解释关键符号。`],
+      ['comparison', '比较辨析', item => `请将${item.citation}中的“${topic}”与一个相关方法或概念进行比较，说明至少一个关键区别。`],
+      ['application', '应用推理', item => `如果在新问题中使用“${topic}”，根据${item.citation}应采取哪些步骤或判断？请说明理由。`],
+      ['diagnosis', '错误诊断', item => `阅读${item.citation}时可能出现什么理解或数值计算错误？请给出发现和纠正方法。`],
+      ['evidence', '证据概括', item => `请用两三句话概括${item.citation}中的关键条件、结论或限制，并保留重要细节。`]
+    ];
+    const itemCount = unique.length ? requestedCount : 0;
+    const items = Array.from({ length: itemCount }, (_, index) => {
+      const item = unique[index % unique.length];
+      const [type, typeLabel, question] = variants[index % variants.length];
+      return { id: `quiz-${Date.now()}-${index}`, type, typeLabel, question: question(item), answer: formatEvidenceText(item.text, findDoc(item.documentId)), citation: item.citation, documentId: item.documentId, locator: item.locator };
+    });
+    return { topic, mode: 'retrieval-grounded-local', items };
+  }
   const unverifiedLearningQuiz = learningQuiz;
   learningQuiz = function (options) {
     const result = unverifiedLearningQuiz(options);
@@ -491,7 +530,7 @@ async function api(req, res, url) {
   return learningDb.runAsUser(auth.user.id, () => requestSettingsContext.run({ value: settings }, () => requestModelConfigContext.run({ configs }, () => apiForUser(req, res, url, auth))));
 }
 async function apiForUser(req, res, url, auth) {
-  const parts = url.pathname.split('/').filter(Boolean); const method = req.method; learningDb.ensureUserSpace(auth.user.id); 
+  const parts = url.pathname.split('/').filter(Boolean); const method = req.method; learningDb.ensureUserSpace(auth.user.id);
   if (['POST', 'PATCH', 'DELETE'].includes(method) && !sameOrigin(req)) return error(res, 'CSRF_ORIGIN_REJECTED', '写请求必须来自当前 StudyAgent 地址。', { status: 403 });
   if (method === 'GET' && url.pathname === '/api/imports') return json(res, 200, { jobs: importJobs.list(auth.user.id) });
   if (method === 'GET' && parts[1] === 'imports' && parts[2]) {
