@@ -16,7 +16,7 @@ async function request(route, options = {}) {
   const target = new URL(route, base);
   const payload = options.body || '';
   const response = await new Promise((resolve, reject) => {
-    const req = http.request({ hostname: target.hostname, port: target.port || 80, path: `${target.pathname}${target.search}`, method: options.method || 'GET', headers: { 'Content-Type': 'application/json', ...(payload ? { 'Content-Length': Buffer.byteLength(payload) } : {}) } }, res => {
+    const req = http.request({ hostname: target.hostname, port: target.port || 80, path: `${target.pathname}${target.search}`, method: options.method || 'GET', headers: { 'Content-Type': 'application/json', ...(cookie ? {Cookie:cookie}:{}), ...(payload ? { 'Content-Length': Buffer.byteLength(payload) } : {}) } }, res => {
       const chunks = [];
       res.on('data', chunk => chunks.push(chunk));
       res.on('end', () => resolve({ status: res.statusCode || 0, body: Buffer.concat(chunks).toString('utf8') }));
@@ -32,6 +32,20 @@ async function request(route, options = {}) {
   return data;
 }
 
+async function waitForImport(jobId) {
+  const deadline = Date.now() + 30 * 60 * 1000;
+  while (Date.now() < deadline) {
+    const job = await request(`/api/imports/${encodeURIComponent(jobId)}`);
+    if (job.status === 'completed') {
+      if (!job.documentId) fail(`completed import ${jobId} has no document id`);
+      return request(`/api/documents/${encodeURIComponent(job.documentId)}`);
+    }
+    if (job.status === 'failed') fail(`${job.filename || jobId} import failed: ${job.error?.message || job.error?.code || 'unknown error'}`);
+    await new Promise(resolve => setTimeout(resolve, 500));
+  }
+  fail(`import ${jobId} did not complete within 30 minutes`);
+}
+
 if (!fs.existsSync(lectureRoot) || !fs.statSync(lectureRoot).isDirectory()) fail(`lecture directory not found: ${lectureRoot}`);
 const files = [];
 for (const entry of fs.readdirSync(lectureRoot, { recursive: true, withFileTypes: true })) {
@@ -44,13 +58,47 @@ if (!files.length) fail(`no supported learning files found under ${lectureRoot}`
 
 const created = [];
 const results = [];
+let cookie = '';
+let probeDocumentId = '';
+const responsiveness = [];
+async function probe() {
+  const start = performance.now();
+  const response = await fetch(`${base}/api/documents/${probeDocumentId}/reading-position`, { method: 'PATCH', headers: { Cookie: cookie, 'Content-Type':'application/json' }, body: JSON.stringify({ currentPage: 2 }), signal: AbortSignal.timeout(5000) });
+  if (!response.ok) throw new Error(`Reading progress probe HTTP ${response.status}`);
+  await response.json();
+  return Math.round(performance.now() - start);
+}
 try {
+  const registered = await fetch(`${base}/api/auth/register`, { method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:`lectures-${runId}@example.com`,username:'Regression Student Lectures',password:'Lecture-Regression-2026!'}) });
+  if (!registered.ok) fail('could not register lecture regression account');
+  cookie = registered.headers.get('set-cookie')?.split(';')[0] || '';
+  if (!cookie) fail('missing lecture regression session');
+  const probeUpload = await fetch(`${base}/api/documents/upload`, { method:'POST',headers:{'Content-Type':'application/json',Cookie:cookie},body:JSON.stringify({name:`${runId}-reader.md`,content:'# Page 1\n\nReading.\n\n# Page 2\n\nPersist progress.'}) });
+  probeDocumentId = (await probeUpload.json()).id;
+  if (!probeDocumentId) fail('could not import reading progress probe');
   for (const file of files) {
     const name = path.basename(file);
     const testName = `${runId}-${name}`;
     console.log(`lecture regression: importing ${displayName(file)} (${Math.ceil(fs.statSync(file).size / 1024 / 1024)} MB)`);
     const raw = fs.readFileSync(file);
-    const imported = await request('/api/documents/upload', { method: 'POST', body: JSON.stringify({ name: testName, base64: raw.toString('base64') }) });
+    const measurements = [], errors = [];
+    let runningProbe = null;
+    const timer = setInterval(() => { if (!runningProbe) runningProbe = probe().then(ms=>measurements.push(ms)).catch(error=>errors.push(error.message)).finally(()=>{runningProbe=null}); },700);
+    let imported;
+    try {
+      // Exercise the same isolated background-import path used by the UI. A
+      // synchronous response serializes the whole parsed lecture and can make
+      // a rapid all-files regression consume far more memory than real usage.
+      const accepted = await request('/api/documents/upload', { method: 'POST', body: JSON.stringify({ name: testName, base64: raw.toString('base64'), async: true }) });
+      const jobId = accepted.jobs?.[0]?.id;
+      if (!jobId) fail(`${displayName(file)} did not create a background import job`);
+      imported = await waitForImport(jobId);
+    }
+    finally { clearInterval(timer); if(runningProbe)await runningProbe; }
+    const metrics={file:displayName(file),samples:measurements.length,maxMs:Math.max(0,...measurements),errors};
+    responsiveness.push(metrics);
+    console.log('reading-during-import:',JSON.stringify(metrics));
+    if(errors.length)fail(`${displayName(file)} blocked reading progress while importing: ${errors.join('; ')}`);
     if (!imported.id || !Array.isArray(imported.content) || !imported.content.length || !imported.structure?.chunks) fail(`${displayName(file)} returned no structured document`);
     created.push(imported.id);
 
@@ -63,11 +111,17 @@ try {
 
     const search = await request(`/api/learning/search?q=${encodeURIComponent(path.basename(name, path.extname(name)).split(/[\s,，._-]+/).filter(Boolean).slice(0, 2).join(' '))}&scope=current-document&documentIds=${encodeURIComponent(imported.id)}&limit=5`);
     if (search.scope !== 'current-document' || search.results.some(item => item.documentId !== imported.id)) fail(`${displayName(file)} retrieval escaped the current document`);
-    const original = await fetch(`${base}/api/documents/${encodeURIComponent(imported.id)}/file`);
-    if (!original.ok || (await original.arrayBuffer()).byteLength !== raw.byteLength) fail(`${displayName(file)} original file bytes were not preserved`);
+    const original = await fetch(`${base}/api/documents/${encodeURIComponent(imported.id)}/file`,{headers:{Cookie:cookie}});
+    if (!original.ok || !Buffer.from(await original.arrayBuffer()).equals(raw)) fail(`${displayName(file)} original file bytes were not preserved`);
 
     const blockTypes = [...new Set(pages.flatMap(page => (page.blocks || []).map(block => block.type)).filter(Boolean))];
     results.push({ file: displayName(file), fileType: imported.fileType || imported.type, pages: pages.length, chunks: imported.structure.chunks, formulas: pages.reduce((count, page) => count + (page.formulas || []).length, 0), blockTypes, searchResults: search.results.length });
+    // Each test copy is disposable. Removing it immediately prevents a
+    // nine-file regression from accumulating duplicate parsed textbooks while
+    // retaining the compact result summary above.
+    await request(`/api/learning/documents/${encodeURIComponent(imported.id)}`, { method: 'DELETE' });
+    const createdIndex = created.indexOf(imported.id);
+    if (createdIndex >= 0) created.splice(createdIndex, 1);
   }
 } finally {
   const cleanupIds = new Set(created);
@@ -78,6 +132,8 @@ try {
   for (const id of cleanupIds) {
     try { await request(`/api/learning/documents/${encodeURIComponent(id)}`, { method: 'DELETE' }); } catch (error) { console.error(error.message); }
   }
+  if(probeDocumentId)await fetch(`${base}/api/learning/documents/${probeDocumentId}`,{method:'DELETE',headers:{Cookie:cookie}});
+  if(cookie)await fetch(`${base}/api/account`,{method:'DELETE',headers:{'Content-Type':'application/json',Cookie:cookie},body:JSON.stringify({confirmation:'DELETE'})});
 }
 
-console.log(JSON.stringify({ ok: true, lectureRoot, files: results.length, results }, null, 2));
+console.log(JSON.stringify({ ok: true, lectureRoot, files: results.length, results, responsiveness }, null, 2));

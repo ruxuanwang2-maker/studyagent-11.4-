@@ -46,9 +46,18 @@ if (!annotations.some(item => item.id === annotation.id)) throw new Error('HTTP 
 if (!String(annotations.find(item => item.id === annotation.id)?.note || '').includes('LaTeX:')) throw new Error('HTTP formula annotation persistence regression');
 if (!(await request(`/api/annotations/${encodeURIComponent(annotation.id)}`, { method: 'DELETE' })).ok) throw new Error('HTTP annotation delete regression');
 
-const createdCard = await request('/api/ai/create-card', { method: 'POST', body: JSON.stringify({ documentId: document.id, page: 1, selectedText: `HTTP card ${suffix} about ${detailNode.label}：给定矩阵 4 E C“““ 和向量 5 E C+`, formula: 'A \\in \\mathbb{C}^{n}', language: 'zh' }) });
+const createdCard = await request('/api/ai/create-card', { method: 'POST', body: JSON.stringify({ documentId: document.id, page: 1, selectedText: `HTTP card ${suffix} about ${detailNode.label}：给定矩阵 4 E C“““ 和向量 5 E C+`, formula: 'A \\in \\mathbb{C}^{n}', category: '矩阵例题', cardType: 'worked-example', language: 'zh' }) });
 if (!createdCard.id) throw new Error('HTTP card create regression');
 if (createdCard.locator?.formulaLatex !== 'A \\in \\mathbb{C}^{n}') throw new Error('HTTP formula card persistence regression');
+if (createdCard.category !== '矩阵例题' || createdCard.cardType !== 'worked-example' || createdCard.structure?.layout !== 'worked-example' || !createdCard.structure?.steps?.length) throw new Error('HTTP structured card persistence regression');
+const categories = await request('/api/cards/categories');
+if (!categories.categories.some(item => item.name === '矩阵例题')) throw new Error('HTTP card category list regression');
+const movedCard = await request(`/api/cards/${encodeURIComponent(createdCard.id)}`, { method: 'PATCH', body: JSON.stringify({ category: '线性代数例题' }) });
+if (movedCard.category !== '线性代数例题') throw new Error('HTTP card category update regression');
+const renamedCategory = await request('/api/cards/categories', { method: 'PATCH', body: JSON.stringify({ from: '线性代数例题', to: '数值算法例题' }) });
+if (!renamedCategory.categories.some(item => item.name === '数值算法例题')) throw new Error('HTTP card category rename regression');
+const removedCategory = await request('/api/cards/categories?name=%E6%95%B0%E5%80%BC%E7%AE%97%E6%B3%95%E4%BE%8B%E9%A2%98', { method: 'DELETE' });
+if (!removedCategory.categories.some(item => item.name === '未分类')) throw new Error('HTTP card category removal regression');
 const cards = await request(`/api/knowledge?documentId=${encodeURIComponent(document.id)}&limit=200`);
 if (!cards.cards.some(item => item.id === createdCard.id)) throw new Error('HTTP card list regression');
 const formulaCard = await request('/api/ai/create-card', { method: 'POST', body: JSON.stringify({ documentId: document.id, page: 1, selectedText: `OCR formula regression ${suffix}：给定矩阵 4 E C“““ 和向量 5 E C+`, formula: 'A \\in \\mathbb{C}^{n}', language: 'zh' }) });
@@ -81,7 +90,7 @@ const formulaLatex = 'A \\in \\mathbb{C}^{n}';
   if (!formulaHistory.messages?.some(item => item.role === 'user' && item.metadata?.formula === formulaLatex)) throw new Error('HTTP formula conversation persistence regression');
 const quiz = await request('/api/learning/quiz', { method: 'POST', body: JSON.stringify({ courseId: document.courseId, count: 6, language: 'zh' }) });
 const quizTypes = [...new Set((quiz.items || []).map(item => item.type).filter(Boolean))];
-if (!Array.isArray(quiz.items) || quiz.items.length < 1 || quizTypes.length < 1) throw new Error(`HTTP varied quiz regression: ${quizTypes.join(',')}`);
+if (!Array.isArray(quiz.items) || quiz.items.length < 4 || quizTypes.length < 3) throw new Error(`HTTP varied quiz regression: ${quizTypes.join(',')}`);
 
 const courses = await request('/api/courses');
 const targetCourse = courses.find(item => item.name !== '未分类');

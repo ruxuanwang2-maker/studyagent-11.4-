@@ -4,12 +4,19 @@ const root = process.cwd();
 const base = process.env.STUDYAGENT_URL || 'http://127.0.0.1:4173';
 const checks = [
   ['syntax', 'scripts/check-syntax.mjs'],
+  ['request-queue', 'scripts/check-request-queue.mjs'],
+  ['upgrade', 'scripts/check-upgrade.mjs'],
+  ['learning-evidence', 'scripts/check-learning-evidence.mjs'],
+  ['prompt-plan', 'scripts/check-prompt-plan.mjs'],
+  ['reading-import-http', 'scripts/check-reading-import-http.mjs'],
   ['math-ocr', 'scripts/check-math-ocr.mjs'],
+  ['ocr-quality', 'scripts/check-ocr-quality.mjs'],
   ['math-ocr-http', 'scripts/check-math-ocr-http.mjs'],
   ['core', 'scripts/check-learning-core.mjs'],
   ['auth', 'scripts/check-auth.mjs'],
   ['multiformat-http', 'scripts/check-multiformat-http.mjs'],
   ['learning-http', 'scripts/check-learning-http.mjs'],
+  ['upgrade-http', 'scripts/check-upgrade-http.mjs'],
   ['learning-closure', 'scripts/check-learning-closure.mjs'],
   ['pdf-regression', 'scripts/check-pdf-regression.mjs'],
   ['lecture-folder', 'scripts/check-lecture-folder.mjs']

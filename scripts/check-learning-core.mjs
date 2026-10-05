@@ -39,8 +39,9 @@ function archiveFixture(name, files) {
 
 const parsedMarkdown = await parseStructuredDocument({ name: 'test.md', buffer: Buffer.from('# Pivoting\nPartial pivoting improves numerical stability.\n\n## Condition number\nA condition number measures sensitivity.', 'utf8') });
 if (parsedMarkdown.sections.length !== 2 || parsedMarkdown.chunks.length < 2) throw new Error('Markdown structure/chunking regression');
-const parsedPdf = await parseStructuredDocument({ name: 'formula.pdf', buffer: Buffer.from('%PDF-structured-test'), parsePdf: () => [{ page: 2, heading: 'Linear system', text: 'Solve the system.', extraction: 'native-pdfjs', blocks: [{ type: 'paragraph', text: 'Solve the system.' }, { type: 'formula', source: '4z 二 5', latex: 'Az = b', confidence: 0.78 }] }] });
+const parsedPdf = await parseStructuredDocument({ name: 'formula.pdf', buffer: Buffer.from('%PDF-structured-test'), parsePdf: () => [{ page: 2, heading: 'Linear system', text: 'Solve the system.', extraction: 'native-pdfjs', blocks: [{ type: 'paragraph', text: 'Solve the system.' }, { type: 'formula', source: '4z 二 5', latex: 'Az = b', confidence: 0.78 }, { type: 'formula', source: 'Az = b', latex: 'Az = b', confidence: 1, provenance: { corrected: true, parser: 'user-correction' } }] }] });
 if (parsedPdf.sections[0]?.locator?.page !== 2 || !parsedPdf.sections[0]?.blocks?.some(block => block.type === 'formula') || !parsedPdf.chunks.some(chunk => chunk.content.includes('Az = b') && chunk.metadata.blockType === 'formula')) throw new Error('PDF formula block persistence regression');
+if (parsedPdf.chunks.some(chunk => chunk.content.includes('4z 二 5'))) throw new Error('Unverified formula OCR leaked into retrieval');
 const parsedCsv = await parseStructuredDocument({ name: 'test.csv', buffer: Buffer.from('name,score\nLU,0.82\nQR,0.61\n', 'utf8') });
 if (parsedCsv.sections.length !== 1 || parsedCsv.sections[0].kind !== 'sheet' || !parsedCsv.chunks.some(chunk => chunk.metadata.blockType === 'table')) throw new Error('CSV table regression');
 const parsedDocx = await parseStructuredDocument({ name: 'lecture.docx', buffer: archiveFixture('docx', { 'word/document.xml': '<w:document><w:body><w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>Pivoting</w:t></w:r></w:p><w:p><w:pPr><w:numPr><w:ilvl w:val="0"/></w:numPr></w:pPr><w:r><w:t>Partial pivoting improves stability.</w:t></w:r></w:p><w:p><m:oMath><m:f><m:num><m:r><m:t>x</m:t></m:r></m:num><m:den><m:r><m:t>y</m:t></m:r></m:den></m:f></m:oMath></w:p><w:tbl><w:tr><w:tc><w:p><w:r><w:t>Method</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>Stable</w:t></w:r></w:p></w:tc></w:tr></w:tbl></w:body></w:document>' }) });
@@ -64,7 +65,11 @@ const testCourse = db.createCourse('Course test', testWorkspace.id);
 const testCourseId = testCourse.id;
 const document = { id: 'test-document', title: 'Core test notes', fileType: 'MD', sourcePath: 'test.md', createdAt: new Date().toISOString(), metadata: {} };
 db.upsertDocument({ document, sections: parsedMarkdown.sections.map(section => ({ ...section, id: `section-${section.position}` })), chunks: parsedMarkdown.chunks.map((chunk, index) => ({ ...chunk, id: `chunk-${index}` })) });
-const persistedCard = db.saveCard({ front: 'What is pivoting?', back: 'Choose a safer pivot.', documentId: document.id, source: 'Core test · p.1', locator: { page: 1 } });
+const persistedCard = db.saveCard({ front: 'What is pivoting?', back: 'Choose a safer pivot.', documentId: document.id, source: 'Core test · p.1', category: '数值稳定性', cardType: 'worked-example', structure: { layout: 'worked-example', strategy: ['Find pivot'], steps: [{ title: 'Choose', content: 'Choose a safer pivot.' }] }, locator: { page: 1 } });
+if (persistedCard.category !== '数值稳定性' || persistedCard.cardType !== 'worked-example' || persistedCard.structure?.steps?.length !== 1) throw new Error('Structured card persistence regression');
+if (!db.listCardCategories().some(item => item.name === '数值稳定性' && item.count === 1)) throw new Error('Card category list regression');
+if (db.renameCardCategory('数值稳定性', '线性代数') !== 1 || db.listCards({ category: '线性代数' })[0]?.id !== persistedCard.id) throw new Error('Card category rename regression');
+if (db.removeCardCategory('线性代数') !== 1 || db.listCards({ category: '未分类' })[0]?.id !== persistedCard.id) throw new Error('Card category removal regression');
 if (!persistedCard?.id || db.listCards({ documentId: document.id })[0]?.front !== 'What is pivoting?') throw new Error('Knowledge card persistence regression');
 const rag = createRagService(db);
 rag.indexChunks(db.getDocumentContext(document.id));
