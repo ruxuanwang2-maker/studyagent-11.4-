@@ -354,3 +354,4 @@ async function renameKnowledgeCardCategory(){if(S.cardCategory==='all')return to
 async function removeKnowledgeCardCategory(){if(S.cardCategory==='all'||S.cardCategory==='未分类')return toast('请先选择一个非默认分类');if(!window.confirm(`移除“${S.cardCategory}”分类？其中卡片会转入“未分类”，不会被删除。`))return;await api(`/api/cards/categories?name=${encodeURIComponent(S.cardCategory)}`,{method:'DELETE'});S.cardCategory='未分类';await refreshKnowledgeCards();toast('分类已移除，卡片已转入未分类')}
 const renderWithKnowledgeCardManager=render;
 render=async function(){const result=await renderWithKnowledgeCardManager();if(S.route==='knowledge')mountKnowledgeCards();return result};
+window.addEventListener('pagehide',()=>{if(S.auth?.guest&&navigator.sendBeacon)navigator.sendBeacon('/api/guest/cleanup',new Blob([],{type:'text/plain'}))});
