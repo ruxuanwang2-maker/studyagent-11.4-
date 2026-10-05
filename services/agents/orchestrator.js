@@ -8,16 +8,19 @@ function createLearningOrchestrator({ ragService, memoryService, learningDb }) {
     if (/关联|之前|历史|related|previous/.test(value)) return 'historical-association';
     return 'tutor';
   }
-  function prepare({ question = '', body = {}, document = null, kind = 'text', scope = {} }) {
-    const memory = body.memoryEnabled === false
-      ? emptyMemory()
-      : memoryService.retrieve(question, { courseId: body.courseId || document?.courseId || null, limit: 6 });
-    const retrieved = ragService.context(body.retrievalQuery || question, scope);
-    const annotations = document?.id ? learningDb.listAnnotations({ documentId: document.id, page: scope.page }) : [];
-    const notes = document?.id ? learningDb.listNotes({ documentId: document.id, limit: 40 }) : [];
-    const recentLearningEvents = body.memoryEnabled === false ? [] : learningDb.listLearningEvents({ courseId: body.courseId || document?.courseId || document?.course_id || undefined, limit: 40 }).filter(event => (document?.id && event.document_id === document.id) || /之前|以前|最近|历史|previous|history/i.test(question)).slice(0, 10);
-    const recentConversation = body.conversationId ? learningDb.listConversationMessages(body.conversationId, 8) : [];
-    const graph = learningDb.listGraph(body.courseId || document?.courseId || document?.course_id || undefined);
+  async function prepare({ question = '', body = {}, document = null, kind = 'text', scope = {} }) {
+    const [memory, retrieved, annotations, notes, learningEvents, recentConversation, graph] = await Promise.all([
+      body.memoryEnabled === false
+        ? Promise.resolve(emptyMemory())
+        : memoryService.retrieve(question, { courseId: body.courseId || document?.courseId || null, limit: 6 }),
+      ragService.context(body.retrievalQuery || question, scope),
+      document?.id ? learningDb.listAnnotations({ documentId: document.id, page: scope.page }) : Promise.resolve([]),
+      document?.id ? learningDb.listNotes({ documentId: document.id, limit: 40 }) : Promise.resolve([]),
+      body.memoryEnabled === false ? Promise.resolve([]) : learningDb.listLearningEvents({ courseId: body.courseId || document?.courseId || document?.course_id || undefined, limit: 40 }),
+      body.conversationId ? learningDb.listConversationMessages(body.conversationId, 8) : Promise.resolve([]),
+      learningDb.listGraph(body.courseId || document?.courseId || document?.course_id || undefined)
+    ]);
+    const recentLearningEvents = learningEvents.filter(event => (document?.id && event.document_id === document.id) || /之前|以前|最近|历史|previous|history/i.test(question)).slice(0, 10);
     const relatedConceptNames = new Set(memory.concepts || []);
     const relatedIds = new Set(graph.nodes.filter(node => relatedConceptNames.has(node.label)).map(node => node.id));
     const persistedRelations = graph.edges.filter(edge => relatedIds.has(edge.source) || relatedIds.has(edge.target)).slice(0, 12);

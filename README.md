@@ -22,7 +22,7 @@ npm start
 
 打开 http://127.0.0.1:4173
 
-结构化文档、章节、分块、向量、笔记、批注、知识卡片、概念、关系、问题、记忆、学习进度、复习计划、账号和会话都会持久化到 `data/studyagent.sqlite`。`data/studyagent.json` 仅作为旧版种子界面的兼容和一次性初始化来源保留。用户上传的本地文件写入 `uploads/`。默认的本地学习助手模式不会请求外部服务；安装 npm 依赖后，OCR 处理也完全在本地执行。
+结构化文档、章节、分块、向量、笔记、批注、知识卡片、概念、关系、问题、记忆、学习进度、复习计划、账号和会话都会持久化到 MySQL。`data/studyagent.json` 仅作为旧版种子界面的兼容和一次性初始化来源保留。用户上传的本地文件写入 `uploads/`。默认的本地学习助手模式不会请求外部服务；安装 npm 依赖后，OCR 处理也完全在本地执行。
 
 未登录时使用游客模式，游客不会写入长期学习记忆；登录个人账号后，文档、课程、对话、RAG 检索、知识图谱、学习进度、Prompt 设置和模型配置都按 `user_id` 隔离。密码使用本地服务端 scrypt 哈希保存，会话使用 HttpOnly、SameSite Cookie；模型配置按用户写入本地加密文件 `data/model-configs/`。账号导出接口为 `GET /api/account/export`，删除账号要求提交 `DELETE` 确认。
 
@@ -40,9 +40,11 @@ PDF 重要说明：在二进制上传修复之前构建的版本可能会显示�
 
 ## 验证
 
-HTTP 服务和 SQLite 使用 Node.js 内置模块；PDF/OCR 依赖 package.json 中的 PDF.js、Tesseract 和语言包，首次运行前需要 `npm install`。可以使用以下命令验证：
+服务端使用 MySQL；启动前需创建数据库并设置连接环境变量。可复制根目录的 `.env.example` 为 `.env`，再填写本机 MySQL 密码；启动时会自动读取 `.env`。`.env` 已加入 `.gitignore`，不要提交包含真实凭据的文件。也可以直接在当前 shell 中设置环境变量。PDF/OCR 依赖 package.json 中的 PDF.js、Tesseract 和语言包，首次运行前需要 `npm install`。
 
 ```powershell
+Copy-Item .env.example .env
+# Edit .env and replace MYSQL_PASSWORD with your MySQL password, then:
 npm start
 Invoke-RestMethod http://127.0.0.1:4173/api/documents
 Invoke-RestMethod http://127.0.0.1:4173/api/knowledge/graph
@@ -50,7 +52,7 @@ Invoke-RestMethod http://127.0.0.1:4173/api/knowledge/graph
 
 ## 架构边界
 
-当前实现刻意保持本地优先 Node 服务器和 SQLite 契约的简洁性。未来可以在现有解析器、向量和模型服务接口之后增加 Python/FastAPI 服务或神经检索适配器，而无需修改阅读器界面。
+当前实现刻意保持本地优先 Node 服务器和 MySQL 数据层契约的简洁性。未来可以在现有解析器、向量和模型服务接口之后增加 Python/FastAPI 服务或神经检索适配器，而无需修改阅读器界面。
 
 ## 多模型 API 与 AI 阅读
 
@@ -79,11 +81,11 @@ API Key 不会完整返回，也不会写入 `data/studyagent.json`。游客兼�
 npm run check:pdf
 ```
 
-HTTP 集成检查（`npm run check:http`）会调用真实的本地服务，验证 SQLite 文档目录、知识点/知识图谱、概念关系、复习队列、笔记/批注/知识卡片的增删改查、SQLite 学习分析以及 workspace/当前页/当前文件/指定文件/课程检索范围；检查结束后会清理自己创建的记录。
+HTTP 集成检查（`npm run check:http`）会调用真实的本地服务，验证 MySQL 文档目录、知识点/知识图谱、概念关系、复习队列、笔记/批注/知识卡片的增删改查、MySQL 学习分析以及 workspace/当前页/当前文件/指定文件/课程检索范围；检查结束后会清理自己创建的记录。
 
-多格式 HTTP 检查（`npm run check:multiformat:http`）会真实上传 Markdown、TXT、CSV、DOCX、PPTX、XLSX 和 PNG，验证结构化 sections/chunks 返回、SQLite 目录持久化和删除闭环；DOCX/PPTX/XLSX 的页面、表格、备注和工作表结构，以及 PNG 的本地 OCR 元数据和原始图片接口也会在同一条服务级链路中校验。检查还会用 Markdown 与 DOCX 走 `POST /api/documents/upload-batch`，验证批量导入、部分失败结果结构和清理闭环。浏览器上传对文本格式使用 UTF-8，对 PDF、Office 和图片使用 Base64，避免二进制文件被文本解码损坏。
+多格式 HTTP 检查（`npm run check:multiformat:http`）会真实上传 Markdown、TXT、CSV、DOCX、PPTX、XLSX 和 PNG，验证结构化 sections/chunks 返回、MySQL 目录持久化和删除闭环；DOCX/PPTX/XLSX 的页面、表格、备注和工作表结构，以及 PNG 的本地 OCR 元数据和原始图片接口也会在同一条服务级链路中校验。检查还会用 Markdown 与 DOCX 走 `POST /api/documents/upload-batch`，验证批量导入、部分失败结果结构和清理闭环。浏览器上传对文本格式使用 UTF-8，对 PDF、Office 和图片使用 Base64，避免二进制文件被文本解码损坏。
 
-完整回归入口为 `npm run verify`（等同于 `npm run check:all`）。它会按顺序执行语法、数学 OCR、核心数据层、账号隔离、多格式 HTTP、原有学习 HTTP、新增真实学习闭环、PDF 高代讲义和桌面讲义文件夹回归；桌面回归默认扫描 `C:\Users\<当前用户>\Desktop\讲义` 下全部支持格式，逐份验证上传、结构化页面/区段、SQLite 目录、当前文件检索、原始字节和删除清理。也可以通过 `STUDYAGENT_LECTURE_DIR` 指定其他讲义目录。大文件导入的 JSON 请求上限为 64 MiB，长时间 OCR 回归的单次请求等待上限为 30 分钟。
+完整回归入口为 `npm run verify`（等同于 `npm run check:all`）。它会按顺序执行语法、数学 OCR、核心数据层、账号隔离、多格式 HTTP、原有学习 HTTP、新增真实学习闭环、PDF 高代讲义和桌面讲义文件夹回归；桌面回归默认扫描 `C:\Users\<当前用户>\Desktop\讲义` 下全部支持格式，逐份验证上传、结构化页面/区段、MySQL 目录、当前文件检索、原始字节和删除清理。也可以通过 `STUDYAGENT_LECTURE_DIR` 指定其他讲义目录。大文件导入的 JSON 请求上限为 64 MiB，长时间 OCR 回归的单次请求等待上限为 30 分钟。
 
 账号隔离检查（`npm run check:auth`）会真实注册两个临时账号，验证会话恢复、长期画像、资料、模型配置、导出和账号删除，并确认 B 账号不能读取 A 账号的数据；检查结束后会清理临时账号。
 
@@ -97,15 +99,15 @@ HTTP 集成检查（`npm run check:http`）会调用真实的本地服务，验�
 
 - 支持的导入类型：PDF、DOCX、DOC、PPTX、PPT、Markdown、TXT、XLSX、XLS、CSV、PNG、JPG/JPEG 和 WEBP。
 - 在源格式能够提供相应信息时，结构化解析器会保留页面、标题、段落、列表、公式、幻灯片文本框、备注、工作表/单元格地址、表格以及图片/OCR 位置。阅读器页面携带带类型的内容块，因此表格、列表、备注、基于 OMML 的公式候选结果和主动调用的 Vision 描述不会被压扁为一整段文本。图片资料先经过本地 OCR；阅读器中的“使用 Vision 分析图表/公式”功能只有在配置视觉模型且用户主动调用时才会运行，并将描述结果持久化后加入检索索引。旧版二进制 DOC/PPT/XLS 会使用可读的打印文本回退路径，按旧版段落拆分并明确标记解析能力受限；OOXML 格式的 DOCX/PPTX/XLSX 使用更丰富的结构化解析路径。
-- SQLite 保存在 `data/studyagent.sqlite`，其中包含 Workspace/Course/Document 记录、章节、分块、向量、问题、记忆、概念、关系和学习进度。
+- MySQL 的 `studyagent` 数据库包含 Workspace/Course/Document 记录、章节、分块、向量、问题、记忆、概念、关系和学习进度。
 - RAG 服务使用结构感知分块：标题、段落、公式、表格、备注和图片等带类型内容块会成为可单独追踪的分块，并写入 `blockType`/`blockIndex` 元数据；非结构化文本则按段落边界和长度上限处理。系统会保存本地哈希向量回退实现（`local-hash-v1`），执行候选池检索、归一化词法加余弦重排，并使用明确的相关性阈值；低相关性分块会在构建上下文之前被排除。模型服务抽象还提供服务器端 `embed()` 和 `vision()` 适配器，对应 `/api/ai/embed` 和 `/api/ai/vision`；`/api/learning/reindex` 可以使用已配置的模型向量服务重建指定文档或课程，而 RAG 默认仍使用离线本地回退实现。
 - 聊天和 `/api/learning/search` 支持 `current-page`、`current-document`、`course`、`documents` 和 `workspace` 上下文范围，并返回检索分块对应的页码/幻灯片/工作表/章节引用。空的课程或文件选择会保持为空，不会静默扩大为整个知识库。
 - 长期记忆与聊天记录分开持久化。“知识库”页面提供可编辑的用户画像记忆（回答风格、公式风格、学习目标和编程语言）、记忆数量、编辑/删除/导出控制、学习进度、总结和测验记录；“设置”可以关闭记忆捕获。每次聊天或阅读提问都提供“保存到长期记忆”的开关，API 也接受 `remember: false`；启用记忆后，已保存的用户画像会加入 Agent 上下文。
 - 历史关联使用相关性阈值和小型概念本体（例如 Gaussian Elimination → Pivoting → Numerical Stability → Backward Error）。当历史问题是通过知识图谱关系检索到时，回答会将其标记为知识图谱关联，而不会假装它是直接的词面匹配；新的概念关系会持久化到 `concept_relations`。
-- 聊天轮次也会保存到 SQLite 的 `conversations` 和 `messages` 表，包括上下文范围、选中文本、引用、服务商和模型元数据。当前会话可以通过 `GET /api/conversations` 和 `GET /api/conversations/:id/messages` 查询；旧版 JSON 消息列表仅为兼容现有界面状态而保留。阅读器进入文档时会创建 `learning_sessions`，聊天和批注会关联当前会话；结束会话后会将可观测原始证据分别整理到 `learning_notes` 和 `learning_experiences`，并把 `rawEvidence` 与 `interpretation` 分开保存。
-- 笔记现在使用 SQLite 的 `notes` 表，而不是原先静态的笔记页面。笔记可以从阅读器选中文本创建，也可以独立创建；每条笔记保留文档/课程/页码/章节元数据，支持编辑和删除，并可跳转回来源页面。
-- 阅读器高亮和批注也已迁移到 SQLite 的 `annotations` 表；`/api/annotations` 以及阅读器高亮操作都使用持久化存储，批注支持 PATCH 编辑并保留 `user_id/course_id/updated_at`。学习分析使用真实的 SQLite 问题、笔记和批注事件，而不是固定的仪表盘数字。
-- 知识卡片持久化在 SQLite 的 `knowledge_cards` 表中；启动时会迁移旧版卡片，创建卡片使用同一存储，删除来源文档时会同时删除关联卡片。
+- 聊天轮次也会保存到 MySQL 的 `conversations` 和 `messages` 表，包括上下文范围、选中文本、引用、服务商和模型元数据。当前会话可以通过 `GET /api/conversations` 和 `GET /api/conversations/:id/messages` 查询；旧版 JSON 消息列表仅为兼容现有界面状态而保留。阅读器进入文档时会创建 `learning_sessions`，聊天和批注会关联当前会话；结束会话后会将可观测原始证据分别整理到 `learning_notes` 和 `learning_experiences`，并把 `rawEvidence` 与 `interpretation` 分开保存。
+- 笔记现在使用 MySQL 的 `notes` 表，而不是原先静态的笔记页面。笔记可以从阅读器选中文本创建，也可以独立创建；每条笔记保留文档/课程/页码/章节元数据，支持编辑和删除，并可跳转回来源页面。
+- 阅读器高亮和批注保存在 MySQL 的 `annotations` 表；`/api/annotations` 以及阅读器高亮操作都使用持久化存储，批注支持 PATCH 编辑并保留 `user_id/course_id/updated_at`。学习分析使用真实的问题、笔记和批注事件，而不是固定的仪表盘数字。
+- 知识卡片持久化在 MySQL 的 `knowledge_cards` 表中；启动时会迁移旧版卡片，创建卡片使用同一存储，删除来源文档时会同时删除关联卡片。
 - 首页和资料库的统计卡片现在读取 `/api/analytics`；它们展示可核验的文档、问题、概念和笔记数量，不再把不受真实活动支撑的固定“学习时长”当作用户数据。
 
 常用本地接口包括 `/api/learning/documents`、`/api/learning/search`、`/api/learning/reindex`、`/api/learning/sessions`、`/api/learning/notes`、`/api/learning/experiences`、`/api/learning/progress`、`/api/learning/summary`、`/api/learning/quiz`、`/api/memory`、`/api/memory/export`、`/api/graph`、`/api/agent/plan`、`/api/agent/context/last`、`/api/ai/embed`、`/api/ai/vision` 和 `/api/questions`。`/api/agent/context/last` 只在开发日志开关或 `STUDYAGENT_DEV_CONTEXT=1` 时返回最近一次真实 Agent 上下文；生产默认关闭。PDF 回归命令会验证上传的高代讲义样例，包括页面渲染、OCR 和公式提取。
@@ -115,7 +117,7 @@ HTTP 集成检查（`npm run check:http`）会调用真实的本地服务，验�
 - 旧版二进制 DOC/PPT/XLS 会优先检测本机的 `soffice`/LibreOffice 转换器；检测到时先转换为 DOCX/PPTX/XLSX，再复用结构化解析器，尽量保留标题、表格、幻灯片和公式。没有转换器或转换失败时会使用可读的打印文本回退路径，并在文档 metadata 与 `/api/parser/status` 中明确标记受限能力；旧版二进制的完整布局恢复仍取决于本地转换器。
 - 默认向量实现是确定性的本地哈希向量（`local-hash-v1`），目的是保证离线可用。它不等同于神经网络向量模型；虽然已经存在模型服务提供的 `embed()` 适配器，但默认不会启用基于远程向量模型的索引。
 - 公式恢复默认使用 PDF 文本/OCR 证据上的本地启发式层；设置 Mathpix App ID 和 App Key 后，解析视图可以调用专用数学 OCR，并将 LaTeX、MathML 和逐行公式结果写回页面、分块与检索索引。原始 PDF 视图仍是排版权威，解析视图会同时暴露 LaTeX 候选结果和原始识别文本，便于人工修正。未配置 Mathpix 时保留本地回退，不伪造远程识别结果。
-- 持久化数据、按页面检索、可编辑的知识图谱节点详情与概念关系、动态 Workspace/Course/Document 页面、基于 SQLite 的每日总结、基于检索内容的测验生成、测验结果持久化、自适应复习间隔以及学习编排器计划均已实现。测验接口会明确使用 `retrieval-grounded-local` 模式；未配置远程模型时不会假装自己是远程 LLM。更丰富的自适应复习 Agent 体验和调度分析仍明确不属于本次迭代范围，而不是用隐藏的模拟功能冒充已经完成。
+- 持久化数据、按页面检索、可编辑的知识图谱节点详情与概念关系、动态 Workspace/Course/Document 页面、基于 MySQL 的每日总结、基于检索内容的测验生成、测验结果持久化、自适应复习间隔以及学习编排器计划均已实现。测验接口会明确使用 `retrieval-grounded-local` 模式；未配置远程模型时不会假装自己是远程 LLM。更丰富的自适应复习 Agent 体验和调度分析仍明确不属于本次迭代范围，而不是用隐藏的模拟功能冒充已经完成。
 
 ## 功能详解：从资料到长期学习记忆
 
@@ -171,7 +173,7 @@ Document
 - Markdown 保存标题层级、段落、列表、表格和代码块；
 - 图片资料保存 OCR 文本、图片元数据，并提供图表/公式 Vision 分析入口。
 
-解析后的页面或区段会进入 SQLite、Chunk 索引和阅读器。阅读器展示的文件名直接来自上传文件名；引用则携带文档 ID、页码/幻灯片/工作表和区段位置，便于从 AI 回答回到原始资料。
+解析后的页面或区段会进入 MySQL、Chunk 索引和阅读器。阅读器展示的文件名直接来自上传文件名；引用则携带文档 ID、页码/幻灯片/工作表和区段位置，便于从 AI 回答回到原始资料。
 
 ### OCR、公式和原始排版
 
@@ -260,7 +262,7 @@ vision()  分析图片、图表和公式
 主要本地数据位置：
 
 ```text
-data/studyagent.sqlite       # 文档、区段、分块、对话、笔记、记忆、图谱和进度
+MySQL studyagent             # 文档、区段、分块、对话、笔记、记忆、图谱和进度
 data/studyagent.json         # 旧版种子数据兼容文件
 data/model-config.enc        # 游客模型配置的本地加密文件
 data/model-configs/           # 登录用户模型配置
@@ -307,7 +309,7 @@ npm run verify
 
 1. 从 `main` 创建功能分支；
 2. 修改解析器、OCR 或公式显示后运行 `npm run check:pdf`；
-3. 修改 API、SQLite、记忆或 RAG 后运行 `npm run check:http` 和对应学习闭环检查；
+3. 修改 API、MySQL 数据层、记忆或 RAG 后运行 `npm run check:http` 和对应学习闭环检查；
 4. 修改账号或权限后运行 `npm run check:auth`；
 5. 提交前运行 `npm run verify`；
 6. 使用 Pull Request 合并，并在描述中记录测试命令和已知限制。
@@ -332,7 +334,7 @@ refactor: improve ...
 - **学习证据，而非掌握百分比**：提问次数、逐条自評结果与错误记录可核对；未评估不等于薄弱，重复自评记住不等于已掌握。当前仍没有独立判题与真实掌握度评估。
 - **后续问答上下文**：课程/资料归属正确的学习事件可以进入内部 Agent 上下文；关闭长期记忆时不向模型提供这些历史事件。
 - **可靠性修复**：有限历史消息改为最近消息；增加中文分词匹配；禁止本地查询向量与远程模型向量混算；保留远程索引并拒绝非法向量；文档替换失败会回滚；工作区对话和调试上下文按用户隔离。
-- **增量迁移**：追加 `schema_migrations`、`chapters` 和 `learning_events`；已有资料库迁移前自动创建 SQLite 备份，不删库重建。
+- **增量迁移**：通过 `schema_migrations` 管理 `chapters` 和 `learning_events` 等结构版本。MySQL DDL 可能隐式提交，迁移前应使用 MySQL 备份工具；已有 SQLite 文件不会自动导入。
 
 新增只读接口：`GET /api/learning/chapters`、`GET /api/learning/events`、`GET /api/learning/mastery`。支持 `courseId` 等范围参数，服务端始终按当前用户限制访问。
 

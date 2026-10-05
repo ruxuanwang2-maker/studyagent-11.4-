@@ -6,7 +6,7 @@
 
 - 前端：原生 HTML / CSS / JavaScript，静态资源由同一 Node 服务提供；PDF.js 4.10 本地资源；公式主要通过自实现 LaTeX → MathML 渲染。
 - 后端：Node.js 22.5+，CommonJS，原生 HTTP 路由，无 Express、TypeScript、ORM、前端构建步骤。
-- 数据库：内置 `node:sqlite` 的同步 SQLite，WAL；原始文件在 `uploads/`，解析资料、学习对象主要在 SQLite。
+- 数据库：通过 `mysql2/promise` 连接 MySQL 连接池；连接由 `MYSQL_HOST`、`MYSQL_PORT`、`MYSQL_USER`、`MYSQL_PASSWORD`、`MYSQL_DATABASE` 配置。原始文件在 `uploads/`，解析资料、学习对象主要在 MySQL。
 - 历史兼容层：`data/studyagent.json` 仍保存部分资料视图、访客设置和历史状态。双存储不是新设计目标，暂不直接删除。
 - AI：服务端 Provider 工厂适配 OpenAI-compatible、Anthropic、Gemini、Mathpix；Ollama 使用兼容接口。
 - OCR：Tesseract.js 中文/英文、Poppler 页面图片、可配置 Mathpix。数学规则校正不是通用数学 OCR 模型。
@@ -19,7 +19,7 @@
 public/                    页面、交互、PDF 阅读、样式
 server.js                  HTTP API、导入协调、学习业务、服务启动
 config/modelProviders.js   Provider 预设及模型列表
-services/db/               SQLite、兼容迁移、版本化迁移
+services/db/               MySQL 连接池、兼容迁移、版本化迁移
 services/documents/        多格式结构解析
 services/rag/              词法 + 本地哈希向量检索、Embedding 索引
 services/memory/           概念规则、历史问题关联、复习记录
@@ -61,13 +61,13 @@ data/ uploads/ tmp/        运行数据；不要上传 GitHub
 
 ## 6. 文档完整调用链
 
-上传 JSON（含 base64）→ 扩展名/大小检查 → 保存原始文件 → PDF 原生文本/OCR 或 Office/文本/表格解析 → Sections/Blocks/Locator → Chunks → SQLite → 本地索引 → 列表/阅读/检索。
+上传 JSON（含 base64）→ 扩展名/大小检查 → 保存原始文件 → PDF 原生文本/OCR 或 Office/文本/表格解析 → Sections/Blocks/Locator → Chunks → MySQL → 本地索引 → 列表/阅读/检索。
 
 PDF 由后端协调 PDF.js、Poppler、OCR；Word/PPT 的原生排版并没有完整重建，解析层主要保留语义结构。旧 DOC/PPT/XLS 在没有 LibreOffice 时仅有限可读字符串提取。图片描述必须配置支持 Vision 的 Provider。
 
 ## 7. RAG
 
-SQLite 存片段和向量；检索先限定当前用户与文档/课程，再按关键词和 96 维本地哈希向量加权排序。没有 BM25、训练式 reranker 或 ANN 索引。远程 Embedding 可建索引，但同步回答检索仍走明确标记的本地检索，不声称已经支持远程查询向量。见 RAG_ARCHITECTURE.md。
+MySQL 存片段和向量；检索先限定当前用户与文档/课程，再按关键词和 96 维本地哈希向量加权排序。没有 BM25、训练式 reranker 或 ANN 索引。远程 Embedding 可建索引，但回答检索仍走明确标记的本地检索，不声称已经支持远程查询向量。见 RAG_ARCHITECTURE.md。
 
 ## 8. 用户数据存储
 
@@ -91,8 +91,8 @@ SQLite 存片段和向量；检索先限定当前用户与文档/课程，再按
 ## 15–19. 技术债、Bug、性能、安全、UX
 
 - 已修复：最近消息查询错误、启动覆盖远程向量、不同模型向量混算、中文词法匹配过弱、文档更新不原子、删除资料误删共享概念、跨用户工作区聊天 ID 冲突、调试上下文跨用户共享。
-- 仍需处理：巨型 server/app 文件、重复函数覆盖、JSON/SQLite 双存储、启动重复导入兼容片段、部分清理操作缺乏事务；阅读页面事件已保存，但旧 progress/lastRead 显示与自动续读位置尚未统一。
-- 性能：同步 SQLite/文件读写、接口全局串行、大文档一次性返回、词法候选先截断、课程多个统计请求，没有分页/后台任务/全量向量搜索。
+- 仍需处理：巨型 server/app 文件、重复函数覆盖、JSON/数据库双存储、启动重复导入兼容片段、部分清理操作缺乏事务；阅读页面事件已保存，但旧 progress/lastRead 显示与自动续读位置尚未统一。
+- 性能：MySQL 异步 I/O/文件读写、接口全局串行、大文档一次性返回、词法候选先截断、课程多个统计请求，没有分页/后台任务/全量向量搜索。
 - 安全：ZIP 解压缺少独立条目验证和展开大小限制；Provider 可配置 URL 是本地管理信任面；自定义 Header 的敏感值仍需服务端脱敏；CSRF/Host 检查及限流需进一步强化。
 - UX：首页固定日期/待办已改为当前日期、账号、真实复习队列；图谱缺 zoom/pan/drag；部分页面中英文不完整；公式渲染不是完整 KaTeX；选中文字的高亮定位尚非精确矩形持久化。
 

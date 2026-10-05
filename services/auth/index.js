@@ -30,17 +30,17 @@ function verifyPassword(password, encoded) {
 }
 
 function createAuthService(learningDb) {
-  function register(input = {}) {
+  async function register(input = {}) {
     const credentials = validateCredentials(input);
-    if (learningDb.getUserByEmail(credentials.email)) throw Object.assign(new Error('该 Email 已注册，请直接登录。'), { code: 'EMAIL_EXISTS', status: 409 });
-    const user = learningDb.createUserAccount({ email: credentials.email, username: credentials.username, passwordHash: hashPassword(credentials.password) });
-    return { user, session: learningDb.createSession(user.id) };
+    if (await learningDb.getUserByEmail(credentials.email)) throw Object.assign(new Error('该 Email 已注册，请直接登录。'), { code: 'EMAIL_EXISTS', status: 409 });
+    const user = await learningDb.createUserAccount({ email: credentials.email, username: credentials.username, passwordHash: hashPassword(credentials.password) });
+    return { user, session: await learningDb.createSession(user.id) };
   }
-  function login(input = {}) {
-    const email = normalizeEmail(input.email); const account = learningDb.getUserAuthByEmail(email);
+  async function login(input = {}) {
+    const email = normalizeEmail(input.email); const account = await learningDb.getUserAuthByEmail(email);
     if (!account || !verifyPassword(String(input.password || ''), account.passwordHash)) throw Object.assign(new Error('Email 或密码不正确。'), { code: 'INVALID_CREDENTIALS', status: 401 });
     delete account.passwordHash;
-    return { user: account, session: learningDb.createSession(account.id) };
+    return { user: account, session: await learningDb.createSession(account.id) };
   }
   return { normalizeEmail, validateCredentials, hashPassword, verifyPassword, register, login };
 }

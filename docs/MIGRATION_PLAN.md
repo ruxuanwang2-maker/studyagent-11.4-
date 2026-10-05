@@ -2,9 +2,9 @@
 
 ## 已执行的机制
 
-先建立历史兼容 Schema/补列，再运行 append-only migrations。schema_migrations 记录已完成版本；每个待迁移版本 BEGIN IMMEDIATE → SQL → 写版本 → COMMIT，错误 ROLLBACK。
+数据库后端现为 MySQL，连接由环境变量配置，`schema_migrations` 记录已完成的结构版本。迁移 SQL 使用 MySQL 语法并尽可能保持可重入。MySQL 的 DDL 会隐式提交，因此迁移不能承诺通过事务回滚恢复结构。
 
-已有 documents 时先 VACUUM INTO：`data/studyagent.sqlite.before-v1-<timestamp>.bak`。备份失败会阻止版本迁移，不继续无保护改库。首次空库无需备份。迁移前旧兼容补列仍是历史逻辑，不宣称已全部迁入新 runner。
+升级或迁移前应使用 `mysqldump` 等 MySQL 工具备份数据库。原先的 `data/studyagent.sqlite` 文件不会由连接层自动导入 MySQL；需保留该文件作为迁移前副本，并在需要保留其中数据时单独执行数据迁移。
 
 v1 新建 chapters/learning_events，并从明确 heading 结构回填章节。历史事件不会凭空回填成“用户学习过”；旧概念/笔记/问答保留。
 
@@ -12,7 +12,7 @@ v1 新建 chapters/learning_events，并从明确 heading 结构回填章节。�
 
 ## 后续迁移（设计，不是已创建）
 
-v2 已实施：reading_positions、document_import_jobs、prompt_optimization_logs.optimization_json；复用原资料/账号/会话表。已发行的 v1 SQL 不修改。迁移前仍采用 SQLite VACUUM INTO 备份；已有库不重建。历史 visited pages 可回填，但旧 Session 排序页集合不能推断精确的最后停留页，精确续读从新版本记录开始。
+v2 已实施：reading_positions、document_import_jobs、prompt_optimization_logs.optimization_json；复用原资料/账号/会话表。历史 visited pages 可回填，但旧 Session 排序页集合不能推断精确的最后停留页，精确续读从新版本记录开始。
 
 | 阶段 | 迁移目标 | 向后兼容方式 |
 |---|---|---|

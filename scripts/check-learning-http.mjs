@@ -12,11 +12,11 @@ async function request(path, options = {}) {
 const documents = await request('/api/documents');
 const document = documents.find(item => item.id === 'doc-e06b943c') || documents.find(item => item.type === 'PDF');
 if (!document) throw new Error('No PDF regression document available for HTTP learning checks');
-if (!document.courseId || !document.structure?.chunks || !Array.isArray(document.content)) throw new Error('HTTP SQLite document catalog regression');
+if (!document.courseId || !document.structure?.chunks || !Array.isArray(document.content)) throw new Error('HTTP MySQL document catalog regression');
 const knowledge = await request('/api/knowledge');
-if (!Array.isArray(knowledge.points) || !knowledge.points.length || !Array.isArray(knowledge.cards)) throw new Error('HTTP SQLite knowledge points regression');
+if (!Array.isArray(knowledge.points) || !knowledge.points.length || !Array.isArray(knowledge.cards)) throw new Error('HTTP MySQL knowledge points regression');
 const graph = await request('/api/knowledge/graph');
-if (!Array.isArray(graph.nodes) || !Array.isArray(graph.edges)) throw new Error('HTTP SQLite knowledge graph regression');
+if (!Array.isArray(graph.nodes) || !Array.isArray(graph.edges)) throw new Error('HTTP MySQL knowledge graph regression');
 if (graph.nodes.length < 2) throw new Error('HTTP knowledge graph needs at least two concepts for relation management regression');
 const detailNode = graph.nodes[0];
 const existingPairs = new Set(graph.edges.map(edge => `${edge.source}:${edge.target}:${edge.type}`));
@@ -28,7 +28,7 @@ const graphAfterRelation = await request('/api/knowledge/graph');
 if (!graphAfterRelation.edges.some(edge => edge.id === createdRelation.id || (edge.source === relationPair.source.id && edge.target === relationPair.target.id && edge.type === 'RELATED_TO'))) throw new Error('HTTP graph relation list regression');
 if (!(await request(`/api/graph/relations/${encodeURIComponent(createdRelation.id)}`, { method: 'DELETE' })).ok) throw new Error('HTTP graph relation delete regression');
 const reviewQueue = await request('/api/review/today');
-if (!Array.isArray(reviewQueue) || reviewQueue.some(item => !String(item.id).startsWith('learning-review-'))) throw new Error('HTTP SQLite review queue regression');
+if (!Array.isArray(reviewQueue) || reviewQueue.some(item => !String(item.id).startsWith('learning-review-'))) throw new Error('HTTP MySQL review queue regression');
 
 const suffix = Date.now().toString(36);
 const createdNote = await request('/api/notes', { method: 'POST', body: JSON.stringify({ title: `HTTP note ${suffix}`, content: `HTTP persistence check for ${detailNode.label}`, documentId: document.id, locator: { page: 1, section: 'Regression', formulaLatex: 'A \\in \\mathbb{C}^{n}' } }) });
@@ -70,7 +70,7 @@ if (!(await request(`/api/notes/${encodeURIComponent(createdNote.id)}`, { method
 if (!(await request(`/api/cards/${encodeURIComponent(createdCard.id)}`, { method: 'DELETE' })).ok) throw new Error('HTTP card delete regression');
 
 const analytics = await request('/api/analytics');
-if (analytics.source !== 'sqlite-learning-events' || !Array.isArray(analytics.dailyActivity) || typeof analytics.documents !== 'number') throw new Error('HTTP analytics regression');
+if (analytics.source !== 'mysql-learning-events' || !Array.isArray(analytics.dailyActivity) || typeof analytics.documents !== 'number') throw new Error('HTTP analytics regression');
 const search = await request('/api/learning/search?q=backward%20error&scope=workspace&limit=3');
 if (search.scope !== 'workspace' || !Array.isArray(search.results)) throw new Error('HTTP workspace retrieval regression');
 const encodedDocumentId = encodeURIComponent(document.id);
@@ -126,4 +126,4 @@ for (const input of planCases) {
   if (input.scope === 'course' && plan.retrieved.some(item => item.courseId !== document.courseId)) throw new Error('HTTP agent course scope leaked outside the course');
   agentPlans[input.scope] = plan.retrieved.length;
 }
-console.log(JSON.stringify({ ok: true, documentId: document.id, note: 'create/update/list/delete', annotation: 'create/list/delete', card: 'create/list/delete', graphRelation: 'create/list/delete', documentOrganization: 'import/move/unassign/delete', formulaContext: 'latex', quizTypes, catalog: 'sqlite', knowledge: 'points/graph', review: 'sqlite', analyticsSource: analytics.source, retrievalScopes: { workspace: search.results.length, currentPage: currentPageSearch.results.length, currentDocument: currentDocumentSearch.results.length, documents: selectedDocumentsSearch.results.length, course: courseSearch.results.length }, agentPlans }));
+console.log(JSON.stringify({ ok: true, documentId: document.id, note: 'create/update/list/delete', annotation: 'create/list/delete', card: 'create/list/delete', graphRelation: 'create/list/delete', documentOrganization: 'import/move/unassign/delete', formulaContext: 'latex', quizTypes, catalog: 'mysql', knowledge: 'points/graph', review: 'mysql', analyticsSource: analytics.source, retrievalScopes: { workspace: search.results.length, currentPage: currentPageSearch.results.length, currentDocument: currentDocumentSearch.results.length, documents: selectedDocumentsSearch.results.length, course: courseSearch.results.length }, agentPlans }));
