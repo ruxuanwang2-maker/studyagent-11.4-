@@ -1,10 +1,14 @@
 const base = process.env.STUDYAGENT_URL || 'http://127.0.0.1:4173';
+let sessionCookie = '';
 
 async function request(path, options = {}) {
-  const response = await fetch(`${base}${path}`, { headers: { 'Content-Type': 'application/json' }, ...options });
+  const headers = { 'Content-Type': 'application/json', ...(sessionCookie ? { Cookie: sessionCookie } : {}), ...(options.headers || {}) };
+  const response = await fetch(`${base}${path}`, { ...options, headers });
   const text = await response.text();
   let data = null;
   try { data = JSON.parse(text); } catch { data = text; }
+  const setCookie = response.headers.get('set-cookie');
+  if (setCookie) sessionCookie = setCookie.split(';')[0];
   if (!response.ok) throw new Error(`${options.method || 'GET'} ${path} -> ${response.status}: ${data?.error?.message || text}`);
   return data;
 }

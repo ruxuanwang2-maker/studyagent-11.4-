@@ -4,7 +4,7 @@
 
 | 表组 | 表 | 职责/隔离 |
 |---|---|---|
-| 账号 | users、user_sessions | scrypt 密码/用户设置/Session |
+| 账号 | users、user_sessions | scrypt 密码/用户设置/Session；`users.is_guest` 标记隔离的访客账号 |
 | 组织 | workspaces、courses | workspace 所属用户；课程通过工作区验归属 |
 | 资料 | documents、document_sections、document_chunks、embeddings | 来源文件、块结构、定位、模型向量 |
 | 会话 | conversations、messages、prompt_optimization_logs | 最近上下文、原始/优化问题与开发日志 |

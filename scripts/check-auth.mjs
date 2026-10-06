@@ -21,6 +21,18 @@ function jsonBody(value) { return JSON.stringify(value); }
 
 const guest = await request('/api/auth/session');
 assert(guest.response.ok && guest.data.guest === true, 'fresh session should be guest');
+const guestCookie = guest.cookie;
+assert(guestCookie && guest.data.user?.id !== 'user-local', 'guest should receive an isolated session identity');
+const guestWorkspace = await request('/api/workspaces', { method: 'POST', body: jsonBody({ name: `Guest private workspace ${suffix}` }) }, guestCookie);
+assert(guestWorkspace.response.ok, 'guest workspace creation failed');
+const otherGuest = await request('/api/auth/session');
+assert(otherGuest.response.ok && otherGuest.data.guest && otherGuest.data.user.id !== guest.data.user.id, 'separate visitors should receive separate guest identities');
+const otherGuestWorkspaces = await request('/api/workspaces', {}, otherGuest.cookie);
+assert(otherGuestWorkspaces.response.ok && !otherGuestWorkspaces.data.some(item => item.id === guestWorkspace.data.id), 'guest workspaces leaked to another visitor');
+const blockedDiscovery = await request('/api/models/discover', { method: 'POST', body: jsonBody({ provider: 'custom', model: 'ssrf-test', apiKey: 'test-key', baseUrl: 'http://127.0.0.1:3306' }) }, guestCookie);
+assert(blockedDiscovery.response.status === 400 && blockedDiscovery.data.error?.code === 'INVALID_MODEL_ENDPOINT', 'model discovery allowed a private endpoint');
+await request('/api/guest/cleanup', { method: 'POST', body: '{}' }, guestCookie);
+await request('/api/guest/cleanup', { method: 'POST', body: '{}' }, otherGuest.cookie);
 
 const registeredA = await request('/api/auth/register', { method: 'POST', body: jsonBody(accounts[0]) });
 assert(registeredA.response.status === 201 && registeredA.data.user?.email === accounts[0].email, 'A registration failed');

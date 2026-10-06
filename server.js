@@ -21,6 +21,7 @@ const { createMemoryService } = require('./services/memory');
 const { createLearningOrchestrator } = require('./services/agents/orchestrator');
 const { createPromptOptimizer, QUERY_TYPES, OPTIMIZATION_LEVELS, ANSWER_MODES } = require('./services/agents/promptOptimizer');
 const { createAuthService } = require('./services/auth');
+const { assertPublicHttpsEndpoint } = require('./services/llm/publicEndpoint');
 const { readJsonBody, createRequestQueue } = require('./services/http/requestQueue');
 const { createImportJobs } = require('./services/documents/importJobs');
 const { localPromptPlan } = require('./services/agents/promptPlan');
@@ -536,16 +537,43 @@ async function buildLearningArtifacts(sessionId) {
 const SESSION_COOKIE = 'studyagent_session';
 const authRateBuckets = new Map();
 function parseCookies(header = '') { return String(header).split(';').map(item => item.trim().split('=').map(decodeURIComponent)).filter(item => item.length === 2).reduce((result, [key, value]) => ({ ...result, [key]: value }), {}); }
-function guestUser() { return { id: 'user-local', email: '', username: 'Guest', avatarUrl: '', guest: true }; }
-async function authContext(req) { const sessionId = parseCookies(req.headers.cookie || '')[SESSION_COOKIE]; const session = (await learningDb.getSession(sessionId)); return session ? { ...session, guest: false } : { user: guestUser(), session: null, guest: true }; }
-function setSessionCookie(res, sessionId, maxAge = 30 * 86400) { res.setHeader('Set-Cookie', `${SESSION_COOKIE}=${encodeURIComponent(sessionId)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}`); }
+function setSessionCookie(res, sessionId, maxAge = 30 * 86400) { const secure = process.env.STUDYAGENT_COOKIE_SECURE === '1' ? '; Secure' : ''; res.setHeader('Set-Cookie', `${SESSION_COOKIE}=${encodeURIComponent(sessionId)}; Path=/; HttpOnly; SameSite=Lax${secure}; Max-Age=${maxAge}`); }
 function clearSessionCookie(res) { setSessionCookie(res, '', 0); }
+async function createGuestContext(res) {
+  const userId = `guest-${crypto.randomUUID()}`;
+  const user = await learningDb.createUserAccount({ id: userId, email: `${userId}@guest.invalid`, username: 'Guest', guest: true });
+  await learningDb.runAsUser(userId, async () => {
+    await learningDb.ensureBootstrap(legacySeedSnapshot, userId);
+    const documents = await learningDb.listDocuments();
+    for (const document of documents) await ragService.indexChunks(await learningDb.getDocumentContext(document.id));
+  });
+  const session = await learningDb.createSession(userId);
+  setSessionCookie(res, session.id);
+  return { ...session, user: { ...user, guest: true }, guest: true };
+}
+async function authContext(req, res) {
+  const sessionId = parseCookies(req.headers.cookie || '')[SESSION_COOKIE];
+  const session = await learningDb.getSession(sessionId);
+  if (session) return { ...session, guest: session.guest, user: { ...session.user, guest: session.guest } };
+  return createGuestContext(res);
+}
+async function deleteGuestAccount(userId) {
+  if (!String(userId || '').startsWith('guest-')) return;
+  const documents = await learningDb.runAsUser(userId, async () => learningDb.listDocuments());
+  await learningDb.runAsUser(userId, async () => learningDb.deleteUserAccount(userId));
+  const seedFiles = new Set((legacySeedSnapshot.documents || []).map(document => document.sourceFile).filter(Boolean).map(name => path.basename(name)));
+  for (const document of documents) {
+    const file = path.resolve(UPLOAD_DIR, path.basename(document.source_path || document.sourceFile || ''));
+    if (!seedFiles.has(path.basename(file)) && file.startsWith(`${path.resolve(UPLOAD_DIR)}${path.sep}`) && fs.existsSync(file)) fs.rmSync(file, { force: true });
+  }
+  modelStoreFor(userId).write([]);
+}
 function sameOrigin(req) { const origin = req.headers.origin || req.headers.referer; return !origin || /^https?:\/\/127\.0\.0\.1(?::\d+)?(?:\/|$)/i.test(origin) || /^https?:\/\/localhost(?::\d+)?(?:\/|$)/i.test(origin); }
 function allowAuthAttempt(req, identity = '') { const key = `${req.socket.remoteAddress || 'local'}:${String(identity || '').toLowerCase()}`; const current = Date.now(); const bucket = authRateBuckets.get(key) || { count: 0, startedAt: current }; if (current - bucket.startedAt > 10 * 60 * 1000) { bucket.count = 0; bucket.startedAt = current; } bucket.count += 1; authRateBuckets.set(key, bucket); return bucket.count <= 12; }
 function safeAccountSettings(input = {}) { const next = {}; if (input.language !== undefined) next.language = input.language === 'en' || input.language === 'English' ? 'en' : 'zh'; if (input.privacy !== undefined) next.privacy = ['selected-only', 'current-page', 'retrieved-chunks'].includes(input.privacy) ? input.privacy : 'retrieved-chunks'; if (input.retrievalK !== undefined) next.retrievalK = Math.max(1, Math.min(20, Number(input.retrievalK) || 8)); if (input.memoryEnabled !== undefined) next.memoryEnabled = Boolean(input.memoryEnabled); if (input.promptOptimization && typeof input.promptOptimization === 'object') next.promptOptimization = input.promptOptimization; return next; }
 function parsePath(reqUrl) { return new URL(reqUrl, 'http://localhost'); }
 async function api(req, res, url) {
-  const auth = (await authContext(req));
+  const auth = (await authContext(req, res));
   const userSettings = auth.guest ? db.settings : (await learningDb.getUserSettings(auth.user.id));
   const settings = { ...db.settings, ...userSettings, memoryEnabled: auth.guest ? false : userSettings?.memoryEnabled !== false, promptOptimization: { ...DEFAULT_PROMPT_SETTINGS, ...(db.settings?.promptOptimization || {}), ...(userSettings?.promptOptimization || {}) } };
   const configs = modelStoreFor(auth.user.id).read();
@@ -564,11 +592,11 @@ async function apiForUser(req, res, url, auth) {
     if (method === 'GET') return json(res, 200, (await learningDb.getReadingPosition(parts[2])));
     if (method === 'PATCH') { const input = await body(req); return json(res, 200, (await learningDb.saveReadingPosition(parts[2], input))); }
   }
-  if (method === 'POST' && url.pathname === '/api/guest/cleanup') { if (!auth.guest) return error(res, 'GUEST_CLEANUP_FORBIDDEN', '登录状态下不清理账号数据。', { status: 403 }); (await resetGuestWorkspace()); return json(res, 200, { ok: true }); }
+  if (method === 'POST' && url.pathname === '/api/guest/cleanup') { if (!auth.guest) return error(res, 'GUEST_CLEANUP_FORBIDDEN', '登录状态下不清理账号数据。', { status: 403 }); await deleteGuestAccount(auth.user.id); const nextGuest = await createGuestContext(res); return json(res, 200, { ok: true, user: nextGuest.user }); }
   if (method === 'GET' && url.pathname === '/api/auth/session') return json(res, 200, { authenticated: !auth.guest, guest: auth.guest, user: auth.user, expiresAt: auth.session?.expiresAt || null });
-  if (method === 'POST' && url.pathname === '/api/auth/register') { const input = await body(req); if (!allowAuthAttempt(req, input.email)) return error(res, 'AUTH_RATE_LIMITED', '尝试次数过多，请稍后再试。', { status: 429 }); try { const result = (await authService.register(input)); (await resetGuestWorkspace()); setSessionCookie(res, result.session.id); return json(res, 201, { authenticated: true, guest: false, user: result.user, expiresAt: result.session.expiresAt }); } catch (e) { return error(res, e.code || 'REGISTER_FAILED', e.message, { status: e.status || 400 }); } }
-  if (method === 'POST' && url.pathname === '/api/auth/login') { const input = await body(req); if (!allowAuthAttempt(req, input.email)) return error(res, 'AUTH_RATE_LIMITED', '尝试次数过多，请稍后再试。', { status: 429 }); try { const result = (await authService.login(input)); (await resetGuestWorkspace()); setSessionCookie(res, result.session.id); return json(res, 200, { authenticated: true, guest: false, user: result.user, expiresAt: result.session.expiresAt }); } catch (e) { return error(res, e.code || 'LOGIN_FAILED', e.message, { status: e.status || 401 }); } }
-  if (method === 'POST' && url.pathname === '/api/auth/logout') { if (auth.session?.id) (await learningDb.deleteSession(auth.session.id)); clearSessionCookie(res); return json(res, 200, { authenticated: false, guest: true, user: guestUser() }); }
+  if (method === 'POST' && url.pathname === '/api/auth/register') { const input = await body(req); if (!allowAuthAttempt(req, input.email)) return error(res, 'AUTH_RATE_LIMITED', '尝试次数过多，请稍后再试。', { status: 429 }); try { const result = (await authService.register(input)); if (auth.guest) await deleteGuestAccount(auth.user.id); setSessionCookie(res, result.session.id); return json(res, 201, { authenticated: true, guest: false, user: result.user, expiresAt: result.session.expiresAt }); } catch (e) { return error(res, e.code || 'REGISTER_FAILED', e.message, { status: e.status || 400 }); } }
+  if (method === 'POST' && url.pathname === '/api/auth/login') { const input = await body(req); if (!allowAuthAttempt(req, input.email)) return error(res, 'AUTH_RATE_LIMITED', '尝试次数过多，请稍后再试。', { status: 429 }); try { const result = (await authService.login(input)); if (auth.guest) await deleteGuestAccount(auth.user.id); setSessionCookie(res, result.session.id); return json(res, 200, { authenticated: true, guest: false, user: result.user, expiresAt: result.session.expiresAt }); } catch (e) { return error(res, e.code || 'LOGIN_FAILED', e.message, { status: e.status || 401 }); } }
+  if (method === 'POST' && url.pathname === '/api/auth/logout') { if (auth.session?.id) (await learningDb.deleteSession(auth.session.id)); const nextGuest = await createGuestContext(res); return json(res, 200, { authenticated: false, guest: true, user: nextGuest.user }); }
   if (method === 'GET' && url.pathname === '/api/account') { if (auth.guest) return error(res, 'AUTH_REQUIRED', '请先登录个人账号。', { status: 401 }); return json(res, 200, { user: (await learningDb.getUserById(auth.user.id)), settings: (await learningDb.getUserSettings(auth.user.id)) }); }
   if (method === 'PATCH' && url.pathname === '/api/account') { if (auth.guest) return error(res, 'AUTH_REQUIRED', '请先登录个人账号。', { status: 401 }); const input = await body(req); try { return json(res, 200, { user: (await learningDb.updateUserAccount(auth.user.id, { username: input.username, avatarUrl: input.avatarUrl })) }); } catch (e) { return error(res, 'ACCOUNT_UPDATE_FAILED', e.message, { status: 400 }); } }
   if (method === 'POST' && url.pathname === '/api/account/password') { if (auth.guest) return error(res, 'AUTH_REQUIRED', '请先登录个人账号。', { status: 401 }); const input = await body(req); const account = (await learningDb.getUserAuthByEmail(auth.user.email)); if (!account || !(await authService.verifyPassword(String(input.currentPassword || ''), account.passwordHash))) return error(res, 'INVALID_CURRENT_PASSWORD', '当前密码不正确。', { status: 401 }); try { (await authService.validateCredentials({ email: auth.user.email, password: input.newPassword })); (await learningDb.updateUserPassword(auth.user.id, (await authService.hashPassword(input.newPassword)))); return json(res, 200, { ok: true }); } catch (e) { return error(res, e.code || 'PASSWORD_UPDATE_FAILED', e.message, { status: e.status || 400 }); } }
@@ -599,7 +627,9 @@ async function apiForUser(req, res, url, auth) {
   if (method === 'POST' && url.pathname === '/api/models/discover') {
     const input = await body(req); const previous = input.id ? currentModelConfigs().find(item => item.id === input.id) : null; const config = normalizeModelConfig(input, previous || {});
     if (!canUseModelConfig(config)) return error(res, 'API_KEY_REQUIRED', '刷新模型列表前请先填写 API Key；Ollama 本地服务可免 Key 使用');
-    try { const models = await createProvider(config).listModels(); modelListCache.set(config.provider, models); return json(res, 200, { models, source: 'remote' }); } catch (e) { return json(res, 200, { models: fallbackModels(config.provider), source: 'fallback', error: { code: e.code || 'MODEL_LIST_FAILED', message: safeMessage(e, '动态模型列表获取失败，已使用本地列表') } }); }
+    let endpoint;
+    try { endpoint = await assertPublicHttpsEndpoint(config.baseUrl); } catch (e) { return error(res, e.code || 'INVALID_MODEL_ENDPOINT', e.message, { status: e.status || 400 }); }
+    try { const models = await createProvider(config).listModels(endpoint); modelListCache.set(config.provider, models); return json(res, 200, { models, source: 'remote' }); } catch (e) { return json(res, 200, { models: fallbackModels(config.provider), source: 'fallback', error: { code: e.code || 'MODEL_LIST_FAILED', message: safeMessage(e, '动态模型列表获取失败，已使用本地列表') } }); }
   }
   if (method === 'GET' && url.pathname === '/api/documents') return json(res, 200, (await Promise.all((await learningDb.listDocuments()).map(async row => (await clientDocumentView(row, false))))));
   if (method === 'GET' && url.pathname === '/api/workspaces') return json(res, 200, (await learningDb.listWorkspaces()));
@@ -819,7 +849,7 @@ async function handleImportRequest(req, res, url) {
   delete input.reprocessDocumentId;
   const reprocessMatch = /^\/api\/documents\/([^/]+)\/reprocess$/.exec(url.pathname);
   if (reprocessMatch) {
-    const owner = (await authContext(req)).user.id;
+    const owner = (await authContext(req, res)).user.id;
     const job = await runQueuedApi.task(async () => {
       learningDb.setUserId(owner);
       const document = await findDoc(decodeURIComponent(reprocessMatch[1]));
@@ -834,7 +864,7 @@ async function handleImportRequest(req, res, url) {
   const files = batch ? input.files : [input];
   if (!Array.isArray(files) || !files.length || files.length > 50) return error(res, 'INVALID_BATCH', '请选择 1–50 个文件。', { status: 400 });
   const created = [], errors = [];
-  const owner = (await authContext(req)).user.id;
+  const owner = (await authContext(req, res)).user.id;
   for (const file of files) {
     try {
       const payload = { ...file, reprocessDocumentId: undefined, courseId: file.courseId || input.courseId, workspaceId: file.workspaceId || input.workspaceId };

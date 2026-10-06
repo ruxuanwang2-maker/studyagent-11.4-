@@ -73,6 +73,10 @@ const migrations = [{
     SET created_at=UTC_TIMESTAMP()
     WHERE CAST(created_at AS CHAR) LIKE '0000-%';
   `
+}, {
+  version: 5,
+  name: 'isolate-guest-accounts',
+  sql: 'SELECT 1'
 }];
 
 async function hasColumn(database, table, column) {
@@ -101,6 +105,10 @@ async function applyMigrations(database, file) {
         if (!(await hasColumn(database, 'knowledge_cards', column))) {
           await database.exec(`ALTER TABLE knowledge_cards ADD COLUMN ${column} ${definition}`);
         }
+      }
+    } else if (migration.version === 5) {
+      if (!(await hasColumn(database, 'users', 'is_guest'))) {
+        await database.exec('ALTER TABLE users ADD COLUMN is_guest TINYINT NOT NULL DEFAULT 0');
       }
     }
     await database.exec(migration.sql);

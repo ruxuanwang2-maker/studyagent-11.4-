@@ -5,7 +5,7 @@ const { tokenize } = require('../rag/tokenize');
 const { applyMigrations } = require('./migrations');
 
 const schema = `
-CREATE TABLE IF NOT EXISTS users (id VARCHAR(255) PRIMARY KEY, name VARCHAR(255) NOT NULL, email VARCHAR(320), password_hash TEXT, avatar_url TEXT, settings_json TEXT NOT NULL DEFAULT ('{}'), created_at DATETIME NOT NULL, updated_at DATETIME NULL DEFAULT NULL);
+CREATE TABLE IF NOT EXISTS users (id VARCHAR(255) PRIMARY KEY, name VARCHAR(255) NOT NULL, email VARCHAR(320), password_hash TEXT, avatar_url TEXT, settings_json TEXT NOT NULL DEFAULT ('{}'), is_guest TINYINT NOT NULL DEFAULT 0, created_at DATETIME NOT NULL, updated_at DATETIME NULL DEFAULT NULL);
 CREATE TABLE IF NOT EXISTS user_sessions (id VARCHAR(255) PRIMARY KEY, user_id VARCHAR(255) NOT NULL, expires_at DATETIME NOT NULL, created_at DATETIME NOT NULL, last_seen_at DATETIME NOT NULL);
 CREATE INDEX user_sessions_user ON user_sessions(user_id, expires_at);
 CREATE TABLE IF NOT EXISTS workspaces (id VARCHAR(255) PRIMARY KEY, user_id VARCHAR(255) NOT NULL, name VARCHAR(255) NOT NULL, description VARCHAR(2000) DEFAULT '', created_at DATETIME NOT NULL);
@@ -213,8 +213,8 @@ async function createLearningDb(file) {
   function defaultWorkspaceId(userId = currentUserId()) { return userId === 'user-local' ? 'workspace-personal' : `workspace-${String(userId).replace(/[^a-zA-Z0-9_-]/g, '-')}`; }
   const stmt = sql => database.prepare(sql);
 
-  function userView(row) { return row ? { id: row.id, email: row.email || '', username: row.name || '', avatarUrl: row.avatar_url || '', createdAt: row.created_at, updatedAt: row.updated_at || row.created_at } : null; }
-  async function createUserAccount({ id: userId = id('user'), email, username, passwordHash, avatarUrl = '' } = {}) { const timestamp = now(); const accountId = userId; (await stmt('INSERT INTO users(id,name,email,password_hash,avatar_url,settings_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)').run(accountId, String(username || email || 'Learner').trim().slice(0, 120), String(email || '').trim().toLowerCase(), passwordHash || null, String(avatarUrl || '').trim().slice(0, 1000), '{}', timestamp, timestamp)); return userView((await stmt('SELECT * FROM users WHERE id=?').get(accountId))); }
+  function userView(row) { return row ? { id: row.id, email: row.email || '', username: row.name || '', avatarUrl: row.avatar_url || '', guest: Boolean(row.is_guest), createdAt: row.created_at, updatedAt: row.updated_at || row.created_at } : null; }
+  async function createUserAccount({ id: userId = id('user'), email, username, passwordHash, avatarUrl = '', guest = false } = {}) { const timestamp = now(); const accountId = userId; (await stmt('INSERT INTO users(id,name,email,password_hash,avatar_url,settings_json,is_guest,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)').run(accountId, String(username || email || 'Learner').trim().slice(0, 120), String(email || '').trim().toLowerCase(), passwordHash || null, String(avatarUrl || '').trim().slice(0, 1000), '{}', guest ? 1 : 0, timestamp, timestamp)); return userView((await stmt('SELECT * FROM users WHERE id=?').get(accountId))); }
   async function getUserByEmail(email) { return userView((await stmt('SELECT * FROM users WHERE lower(email)=lower(?)').get(String(email || '').trim()))); }
   async function getUserById(userId = currentUserId()) { return userView((await stmt('SELECT * FROM users WHERE id=?').get(userId))); }
   async function getUserAuthByEmail(email) { const row = (await stmt('SELECT * FROM users WHERE lower(email)=lower(?)').get(String(email || '').trim())); return row ? { ...userView(row), passwordHash: row.password_hash } : null; }
@@ -230,7 +230,7 @@ async function createLearningDb(file) {
     return { workspaceId, courseId };
   }
   async function createSession(userId, ttlMs = 30 * 86400000) { const sessionId = crypto.randomBytes(32).toString('base64url'); const timestamp = now(); const expires = new Date(Date.now() + ttlMs).toISOString(); (await stmt('INSERT INTO user_sessions(id,user_id,expires_at,created_at,last_seen_at) VALUES(?,?,?,?,?)').run(sessionId, userId, expires, timestamp, timestamp)); return { id: sessionId, userId, expiresAt: expires }; }
-  async function getSession(sessionId) { if (!sessionId) return null; const row = (await stmt('SELECT s.*,u.name,u.email,u.avatar_url,u.created_at user_created_at,u.updated_at user_updated_at FROM user_sessions s JOIN users u ON u.id=s.user_id WHERE s.id=? AND s.expires_at>?').get(sessionId, now())); if (!row) return null; (await stmt('UPDATE user_sessions SET last_seen_at=? WHERE id=?').run(now(), sessionId)); return { id: row.id, userId: row.user_id, expiresAt: row.expires_at, user: { id: row.user_id, email: row.email || '', username: row.name || '', avatarUrl: row.avatar_url || '', createdAt: row.user_created_at, updatedAt: row.user_updated_at || row.user_created_at } }; }
+  async function getSession(sessionId) { if (!sessionId) return null; const row = (await stmt('SELECT s.*,u.name,u.email,u.avatar_url,u.is_guest,u.created_at user_created_at,u.updated_at user_updated_at FROM user_sessions s JOIN users u ON u.id=s.user_id WHERE s.id=? AND s.expires_at>?').get(sessionId, now())); if (!row) return null; (await stmt('UPDATE user_sessions SET last_seen_at=? WHERE id=?').run(now(), sessionId)); return { id: row.id, userId: row.user_id, expiresAt: row.expires_at, guest: Boolean(row.is_guest), user: { id: row.user_id, email: row.email || '', username: row.name || '', avatarUrl: row.avatar_url || '', guest: Boolean(row.is_guest), createdAt: row.user_created_at, updatedAt: row.user_updated_at || row.user_created_at } }; }
   async function deleteSession(sessionId) { return (await stmt('DELETE FROM user_sessions WHERE id=?').run(sessionId)).changes > 0; }
   async function deleteUserAccount(userId) {
     const documentIds = (await (await stmt('SELECT id FROM documents WHERE user_id=?').all(userId)).map(row => row.id));
@@ -262,30 +262,32 @@ async function createLearningDb(file) {
     return { ok: result > 0, sessions: sessionResult, documents: documentIds.length, concepts: conceptIds.length, workspaces: workspaceIds.length, conversations: conversationIds.length };
   }
 
-  async function ensureBootstrap(legacy) {
-    const userId = 'user-local';
-    const workspaceId = 'workspace-personal';
+  async function ensureBootstrap(legacy, targetUserId = 'user-local') {
+    const userId = targetUserId;
+    const seedPrefix = userId === 'user-local' ? '' : `${userId}-`;
+    const workspaceId = defaultWorkspaceId(userId);
     const courseNames = new Map();
-    (await stmt('INSERT IGNORE INTO users(id,name,created_at) VALUES(?,?,?)').run(userId, 'Local learner', now()));
+    (await stmt('INSERT IGNORE INTO users(id,name,created_at) VALUES(?,?,?)').run(userId, userId === 'user-local' ? 'Local learner' : 'Guest', now()));
     (await stmt('INSERT IGNORE INTO workspaces(id,user_id,name,description,created_at) VALUES(?,?,?,?,?)').run(workspaceId, userId, 'Personal Learning Workspace', '本地优先的个人学习工作区', now()));
     for (const legacyDoc of legacy?.documents || []) {
-      const courseId = `course-${String(legacyDoc.course || '未分类').replace(/[^\w\u4e00-\u9fff]+/g, '-').slice(0, 40) || 'uncategorized'}`;
+      const documentId = `${seedPrefix}${legacyDoc.id}`;
+      const courseId = `${seedPrefix}course-${String(legacyDoc.course || '未分类').replace(/[^\w\u4e00-\u9fff]+/g, '-').slice(0, 40) || 'uncategorized'}`;
       if (!courseNames.has(courseId)) {
         (await stmt('INSERT IGNORE INTO courses(id,workspace_id,name,description,created_at) VALUES(?,?,?,?,?)').run(courseId, workspaceId, legacyDoc.course || '未分类', '', now()));
         courseNames.set(courseId, true);
       }
       (await stmt('INSERT IGNORE INTO documents(id,user_id,workspace_id,course_id,title,file_type,source_path,created_at,metadata_json,legacy_json) VALUES(?,?,?,?,?,?,?,?,?,?)').run(
-        legacyDoc.id, userId, workspaceId, courseId, legacyDoc.title || legacyDoc.id, legacyDoc.type || 'TXT', legacyDoc.sourceFile || '', mysqlDateTime(legacyDoc.uploadedAt || now()), json({ pages: legacyDoc.pages, extraction: legacyDoc.extraction, tags: legacyDoc.tags }), json(legacyDoc)
+        documentId, userId, workspaceId, courseId, legacyDoc.title || legacyDoc.id, legacyDoc.type || 'TXT', legacyDoc.sourceFile || '', mysqlDateTime(legacyDoc.uploadedAt || now()), json({ pages: legacyDoc.pages, extraction: legacyDoc.extraction, tags: legacyDoc.tags }), json(legacyDoc)
       ));
       for (const [index, page] of (legacyDoc.content || []).entries()) {
-        const sectionId = `${legacyDoc.id}-section-${page.page || index + 1}`;
-        (await stmt('INSERT IGNORE INTO document_sections(id,document_id,title,content,locator_json,position,kind) VALUES(?,?,?,?,?,?,?)').run(sectionId, legacyDoc.id, page.heading || `Page ${page.page || index + 1}`, page.text || '', json({ page: page.page || index + 1, source: page.source || 'legacy' }), index, page.type === 'formula' ? 'formula' : 'page'));
+        const sectionId = `${documentId}-section-${page.page || index + 1}`;
+        (await stmt('INSERT IGNORE INTO document_sections(id,document_id,title,content,locator_json,position,kind) VALUES(?,?,?,?,?,?,?)').run(sectionId, documentId, page.heading || `Page ${page.page || index + 1}`, page.text || '', json({ page: page.page || index + 1, source: page.source || 'legacy' }), index, page.type === 'formula' ? 'formula' : 'page'));
         const chunkId = `${sectionId}-chunk-1`;
-        (await stmt('INSERT IGNORE INTO document_chunks(id,document_id,section_id,content,chunk_index,metadata_json) VALUES(?,?,?,?,?,?)').run(chunkId, legacyDoc.id, sectionId, page.text || '', 0, json({ page: page.page || index + 1, heading: page.heading || '' })));
+        (await stmt('INSERT IGNORE INTO document_chunks(id,document_id,section_id,content,chunk_index,metadata_json) VALUES(?,?,?,?,?,?)').run(chunkId, documentId, sectionId, page.text || '', 0, json({ page: page.page || index + 1, heading: page.heading || '' })));
       }
     }
     for (const legacyMemory of legacy?.knowledge || []) {
-      const conceptId = `concept-${legacyMemory.id || id('legacy')}`;
+      const conceptId = `${seedPrefix}concept-${legacyMemory.id || id('legacy')}`;
       const metadata = { description: legacyMemory.description || '', source: legacyMemory.source || '', difficulty: legacyMemory.difficulty || '', importance: legacyMemory.importance || '', color: legacyMemory.color || '', migrated: true };
       (await stmt('INSERT IGNORE INTO concepts(id,user_id,course_id,name,mastery_score,status,first_seen,last_seen,metadata_json) VALUES(?,?,?,?,?,?,?,?,?)').run(conceptId, userId, null, legacyMemory.name, Number(legacyMemory.mastery || 0), Number(legacyMemory.mastery || 0) >= 0.8 ? 'mastered' : 'learning', now(), now(), json(metadata)));
       const existing = (await stmt('SELECT metadata_json FROM concepts WHERE id=?').get(conceptId));
@@ -293,19 +295,19 @@ async function createLearningDb(file) {
     }
     for (const legacyAnnotation of legacy?.annotations || []) {
       if (!legacyAnnotation.documentId) continue;
-      (await stmt('INSERT IGNORE INTO annotations(id,document_id,page,type,color,text,note,created_at) VALUES(?,?,?,?,?,?,?,?)').run(legacyAnnotation.id || id('annotation'), legacyAnnotation.documentId, Number(legacyAnnotation.page || 0) || null, legacyAnnotation.type || 'highlight', legacyAnnotation.color || '', legacyAnnotation.text || '', legacyAnnotation.note || '', mysqlDateTime(legacyAnnotation.createdAt || now())));
+      (await stmt('INSERT IGNORE INTO annotations(id,document_id,page,type,color,text,note,created_at) VALUES(?,?,?,?,?,?,?,?)').run(`${seedPrefix}${legacyAnnotation.id || id('annotation')}`, `${seedPrefix}${legacyAnnotation.documentId}`, Number(legacyAnnotation.page || 0) || null, legacyAnnotation.type || 'highlight', legacyAnnotation.color || '', legacyAnnotation.text || '', legacyAnnotation.note || '', mysqlDateTime(legacyAnnotation.createdAt || now())));
     }
     for (const legacyCard of legacy?.cards || []) {
-      (await stmt('INSERT IGNORE INTO knowledge_cards(id,user_id,course_id,document_id,front,back,source_label,locator_json,due_at,mastery_score,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)').run(legacyCard.id || id('card'), userId, null, legacyCard.documentId || null, legacyCard.front || '', legacyCard.back || '', legacyCard.source || '', json({ page: legacyCard.page || null }), legacyCard.due || null, Number(legacyCard.mastery || 0), now(), now()));
+      (await stmt('INSERT IGNORE INTO knowledge_cards(id,user_id,course_id,document_id,front,back,source_label,locator_json,due_at,mastery_score,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)').run(`${seedPrefix}${legacyCard.id || id('card')}`, userId, null, legacyCard.documentId ? `${seedPrefix}${legacyCard.documentId}` : null, legacyCard.front || '', legacyCard.back || '', legacyCard.source || '', json({ page: legacyCard.page || null }), legacyCard.due || null, Number(legacyCard.mastery || 0), now(), now()));
     }
     for (const legacyTask of legacy?.reviewTasks || []) {
-      const conceptId = legacyTask.knowledgeId ? `concept-${legacyTask.knowledgeId}` : null;
+      const conceptId = legacyTask.knowledgeId ? `${seedPrefix}concept-${legacyTask.knowledgeId}` : null;
       const concept = conceptId ? (await stmt('SELECT id FROM concepts WHERE id=? AND user_id=?').get(conceptId, userId)) : (await stmt('SELECT id FROM concepts WHERE user_id=? AND name=?').get(userId, legacyTask.title || ''));
       if (!concept) continue;
       const scheduled = (await stmt('SELECT id FROM review_schedule WHERE user_id=? AND concept_id=?').get(userId, concept.id));
       if (!scheduled) {
         const nextReview = /today|今天/i.test(String(legacyTask.due || '')) ? now() : new Date(Date.now() + 86400000).toISOString();
-        (await stmt('INSERT INTO review_schedule(id,user_id,concept_id,next_review_at,interval_days,ease,repetitions,last_result,updated_at) VALUES(?,?,?,?,?,?,?,?,?)').run(`review-${legacyTask.id || concept.id}`, userId, concept.id, nextReview, 0, 2.5, 0, null, now()));
+        (await stmt('INSERT INTO review_schedule(id,user_id,concept_id,next_review_at,interval_days,ease,repetitions,last_result,updated_at) VALUES(?,?,?,?,?,?,?,?,?)').run(`${seedPrefix}review-${legacyTask.id || concept.id}`, userId, concept.id, nextReview, 0, 2.5, 0, null, now()));
       }
     }
     const relationSeeds = [['Forward Error', 'Backward Error', 'contrasts_with'], ['Forward Error', 'Condition Number', 'related'], ['Backward Error', 'Condition Number', 'related']];
