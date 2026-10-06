@@ -6,12 +6,17 @@ function normalizeEmail(value) {
   return String(value || '').trim().toLowerCase();
 }
 
-function validateCredentials({ email, password, username } = {}) {
+function normalizeLoginName(value) { return String(value || '').trim().toLowerCase(); }
+
+function validateCredentials({ email, loginName, password, username } = {}) {
   const normalizedEmail = normalizeEmail(email);
-  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)) throw Object.assign(new Error('请输入有效的 Email 地址。'), { code: 'INVALID_EMAIL', status: 400 });
+  const normalizedLoginName = normalizeLoginName(loginName);
+  if (normalizedLoginName) {
+    if (!/^[\p{L}\p{N}_.-]{3,32}$/u.test(normalizedLoginName)) throw Object.assign(new Error('本地用户名须为 3–32 位文字、数字、下划线、点或短横线。'), { code: 'INVALID_LOGIN_NAME', status: 400 });
+  } else if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)) throw Object.assign(new Error('请输入本地用户名。'), { code: 'INVALID_LOGIN_NAME', status: 400 });
   if (String(password || '').length < PASSWORD_MIN_LENGTH) throw Object.assign(new Error(`密码至少需要 ${PASSWORD_MIN_LENGTH} 个字符。`), { code: 'WEAK_PASSWORD', status: 400 });
   if (username !== undefined && !String(username || '').trim()) throw Object.assign(new Error('用户名不能为空。'), { code: 'INVALID_USERNAME', status: 400 });
-  return { email: normalizedEmail, username: String(username || normalizedEmail.split('@')[0]).trim().slice(0, 120), password: String(password) };
+  return { email: normalizedLoginName ? null : normalizedEmail, loginName: normalizedLoginName || null, username: String(username || normalizedLoginName || normalizedEmail.split('@')[0]).trim().slice(0, 120), password: String(password) };
 }
 
 function hashPassword(password) {
@@ -32,13 +37,15 @@ function verifyPassword(password, encoded) {
 function createAuthService(learningDb) {
   async function register(input = {}) {
     const credentials = validateCredentials(input);
-    if (await learningDb.getUserByEmail(credentials.email)) throw Object.assign(new Error('该 Email 已注册，请直接登录。'), { code: 'EMAIL_EXISTS', status: 409 });
-    const user = await learningDb.createUserAccount({ email: credentials.email, username: credentials.username, passwordHash: hashPassword(credentials.password) });
+    if (credentials.loginName && await learningDb.getUserByLoginName(credentials.loginName)) throw Object.assign(new Error('该本地用户名已被使用。'), { code: 'LOGIN_NAME_EXISTS', status: 409 });
+    if (credentials.email && await learningDb.getUserByEmail(credentials.email)) throw Object.assign(new Error('该 Email 已注册，请直接登录。'), { code: 'EMAIL_EXISTS', status: 409 });
+    const user = await learningDb.createUserAccount({ email: credentials.email, loginName: credentials.loginName, username: credentials.username, passwordHash: hashPassword(credentials.password) });
     return { user, session: await learningDb.createSession(user.id) };
   }
   async function login(input = {}) {
-    const email = normalizeEmail(input.email); const account = await learningDb.getUserAuthByEmail(email);
-    if (!account || !verifyPassword(String(input.password || ''), account.passwordHash)) throw Object.assign(new Error('Email 或密码不正确。'), { code: 'INVALID_CREDENTIALS', status: 401 });
+    const identity = String(input.loginId || input.loginName || input.email || '').trim();
+    const account = identity.includes('@') ? await learningDb.getUserAuthByEmail(normalizeEmail(identity)) : await learningDb.getUserAuthByLoginName(normalizeLoginName(identity));
+    if (!account || !verifyPassword(String(input.password || ''), account.passwordHash)) throw Object.assign(new Error('用户名或密码不正确。'), { code: 'INVALID_CREDENTIALS', status: 401 });
     delete account.passwordHash;
     return { user: account, session: await learningDb.createSession(account.id) };
   }

@@ -34,6 +34,23 @@ assert(blockedDiscovery.response.status === 400 && blockedDiscovery.data.error?.
 await request('/api/guest/cleanup', { method: 'POST', body: '{}' }, guestCookie);
 await request('/api/guest/cleanup', { method: 'POST', body: '{}' }, otherGuest.cookie);
 
+const localLoginName = `regression_${suffix.replace(/[^a-z0-9]/gi, '').slice(-18)}`;
+const localPassword = 'Local-study-2026!';
+const localRegistration = await request('/api/auth/register', { method: 'POST', body: jsonBody({ loginName: localLoginName, password: localPassword }) });
+assert(localRegistration.response.status === 201 && localRegistration.data.user?.loginName === localLoginName && !localRegistration.data.user?.email, 'local username registration failed');
+const localCookie = localRegistration.cookie;
+const duplicateLocal = await request('/api/auth/register', { method: 'POST', body: jsonBody({ loginName: localLoginName.toUpperCase(), password: localPassword }) });
+assert(duplicateLocal.response.status === 409, 'duplicate local username was accepted');
+const badLocalPassword = await request('/api/account/password', { method: 'POST', body: jsonBody({ currentPassword: 'wrong-password', newPassword: 'Changed-local-2026!' }) }, localCookie);
+assert(badLocalPassword.response.status === 401, 'local account accepted wrong current password');
+const changedLocalPassword = await request('/api/account/password', { method: 'POST', body: jsonBody({ currentPassword: localPassword, newPassword: 'Changed-local-2026!' }) }, localCookie);
+assert(changedLocalPassword.response.ok, 'local account password change failed');
+await request('/api/auth/logout', { method: 'POST' }, localCookie);
+const localLogin = await request('/api/auth/login', { method: 'POST', body: jsonBody({ loginId: localLoginName, password: 'Changed-local-2026!' }) });
+assert(localLogin.response.ok && localLogin.data.user?.loginName === localLoginName, 'local username login failed');
+const localDelete = await request('/api/account', { method: 'DELETE', body: jsonBody({ confirmation: 'DELETE' }) }, localLogin.cookie);
+assert(localDelete.response.ok, 'local account cleanup failed');
+
 const registeredA = await request('/api/auth/register', { method: 'POST', body: jsonBody(accounts[0]) });
 assert(registeredA.response.status === 201 && registeredA.data.user?.email === accounts[0].email, 'A registration failed');
 const cookieA = registeredA.cookie;
@@ -89,4 +106,4 @@ assert(loginDeletedA.response.status === 401, 'deleted A account can still log i
 
 const deletedB = await request('/api/account', { method: 'DELETE', body: jsonBody({ confirmation: 'DELETE' }) }, cookieB);
 assert(deletedB.response.ok && deletedB.data.ok === true, 'B deletion failed');
-console.log('auth isolation ok: guest, registration, session restore, user-scoped memory, note/annotation ownership, export and account deletion');
+console.log('auth isolation ok: local usernames, legacy email login, password change, guest, session restore, user-scoped memory, note/annotation ownership, export and account deletion');

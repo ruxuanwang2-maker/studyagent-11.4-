@@ -29,19 +29,22 @@ export async function mountPdfReader(root, options) {
   root.append(loading);
   const task = getDocument({ url: options.url });
   const pdf = await task.promise;
-  const pageNumber = Math.min(Math.max(1, Number(options.page) || 1), pdf.numPages);
+  let currentPage = Math.min(Math.max(1, Number(options.page) || 1), pdf.numPages);
   let scale = Number(options.scale) || 1;
   let destroyed = false;
   let renderToken = 0;
+  let preloadObserver = null;
+  let currentPageObserver = null;
+  const renderedPages = new Map();
+  const scrollContainer = options.scrollContainer || root.closest('.viewer-wrap') || root;
 
-  async function renderPage() {
-    const token = ++renderToken;
+  async function renderPage(pageNumber, pageEl, token) {
+    if (destroyed || pageEl.dataset.rendering === 'true' || pageEl.dataset.rendered === 'true') return;
+    pageEl.dataset.rendering = 'true';
     const page = await pdf.getPage(pageNumber);
     const viewport = page.getViewport({ scale });
     if (destroyed || token !== renderToken) return;
-    root.replaceChildren();
-    const pageEl = document.createElement('div');
-    pageEl.className = 'pdf-page';
+    pageEl.replaceChildren();
     pageEl.style.width = `${viewport.width}px`;
     pageEl.style.height = `${viewport.height}px`;
     const canvas = document.createElement('canvas');
@@ -56,24 +59,71 @@ export async function mountPdfReader(root, options) {
     const annotationLayer = document.createElement('div');
     annotationLayer.className = 'pdf-annotation-layer';
     pageEl.append(canvas, textLayer, annotationLayer);
-    root.append(pageEl);
     const context = canvas.getContext('2d', { alpha: false });
     context.setTransform(dpr, 0, 0, dpr, 0, 0);
     await page.render({ canvasContext: context, viewport }).promise;
     const textContent = await page.getTextContent();
+    if (destroyed || token !== renderToken) return;
     renderTextLayer(textLayer, textContent, viewport);
     textLayer.addEventListener('mouseup', event => {
       const selection = window.getSelection()?.toString().trim();
-      if (!selection || typeof options.onSelect !== 'function') return;
-      const rect = textLayer.getBoundingClientRect();
-      options.onSelect({ text: selection, rect: { left: event.clientX - rect.left, top: event.clientY - rect.top } });
+      if (typeof options.onSelect !== 'function') return;
+      const viewerRect = scrollContainer.getBoundingClientRect();
+      options.onSelect({ text: selection || '', page: pageNumber, rect: { left: event.clientX - viewerRect.left, top: event.clientY - viewerRect.top } });
     });
+    pageEl.dataset.rendering = 'false';
+    pageEl.dataset.rendered = 'true';
+    renderedPages.set(pageNumber, pageEl);
   }
 
-  await renderPage();
+  async function buildContinuousPages({ preservePage = currentPage } = {}) {
+    const token = ++renderToken;
+    preloadObserver?.disconnect();
+    currentPageObserver?.disconnect();
+    renderedPages.clear();
+    root.replaceChildren();
+    const firstPage = await pdf.getPage(1);
+    const firstViewport = firstPage.getViewport({ scale });
+    if (destroyed || token !== renderToken) return;
+    const fragment = document.createDocumentFragment();
+    for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
+      const shell = document.createElement('section');
+      shell.className = 'pdf-page pdf-page-shell';
+      shell.dataset.page = String(pageNumber);
+      shell.style.width = `${firstViewport.width}px`;
+      shell.style.height = `${firstViewport.height}px`;
+      shell.innerHTML = `<div class="pdf-page-placeholder">第 ${pageNumber} 页</div>`;
+      fragment.append(shell);
+    }
+    root.append(fragment);
+    const shells = [...root.querySelectorAll('.pdf-page-shell')];
+    preloadObserver = new IntersectionObserver(entries => {
+      for (const entry of entries) if (entry.isIntersecting) renderPage(Number(entry.target.dataset.page), entry.target, token).catch(() => {
+        entry.target.dataset.rendering = 'false';
+        entry.target.innerHTML = '<div class="pdf-reader-status">本页渲染失败，可继续滚动后重试。</div>';
+      });
+    }, { root: scrollContainer, rootMargin: '1200px 0px', threshold: 0.01 });
+    currentPageObserver = new IntersectionObserver(entries => {
+      const visible = entries.filter(entry => entry.isIntersecting).sort((a, b) => b.intersectionRatio - a.intersectionRatio)[0];
+      if (!visible) return;
+      const next = Number(visible.target.dataset.page);
+      if (next === currentPage) return;
+      currentPage = next;
+      if (typeof options.onPageChange === 'function') options.onPageChange(next);
+    }, { root: scrollContainer, threshold: [0.3, 0.5, 0.7] });
+    shells.forEach(shell => { preloadObserver.observe(shell); currentPageObserver.observe(shell); });
+    requestAnimationFrame(() => shells[Math.max(0, preservePage - 1)]?.scrollIntoView({ block: 'start' }));
+  }
+
+  await buildContinuousPages();
   return {
     pageCount: pdf.numPages,
-    setZoom(next) { scale = Math.max(0.5, Math.min(3, Number(next) || 1)); renderPage().catch(() => {}); },
-    async destroy() { destroyed = true; root.replaceChildren(); await pdf.destroy(); }
+    goToPage(next) {
+      currentPage = Math.min(pdf.numPages, Math.max(1, Number(next) || 1));
+      root.querySelector(`[data-page="${currentPage}"]`)?.scrollIntoView({ block: 'start', behavior: 'smooth' });
+      if (typeof options.onPageChange === 'function') options.onPageChange(currentPage);
+    },
+    setZoom(next) { scale = Math.max(0.5, Math.min(3, Number(next) || 1)); buildContinuousPages({ preservePage: currentPage }).catch(() => {}); },
+    async destroy() { destroyed = true; preloadObserver?.disconnect(); currentPageObserver?.disconnect(); root.replaceChildren(); await pdf.destroy(); }
   };
 }

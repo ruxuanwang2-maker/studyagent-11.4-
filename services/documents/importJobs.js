@@ -1,5 +1,5 @@
 const path = require('node:path');
-const { Worker } = require('node:worker_threads');
+const { fork } = require('node:child_process');
 const { randomUUID } = require('node:crypto');
 
 // Parsing never touches the database or the HTTP server's mutable user context.
@@ -32,7 +32,16 @@ async function createImportJobs({ learningDb, queueTask, commit, maxPending = 4,
     if (active.size || !pending.length) return;
     const job = pending.shift();
     active.set(job.id, job);
-    const worker = new Worker(path.join(__dirname, 'importWorker.js'), { workerData: job.payload, resourceLimits: { maxOldGenerationSizeMb: 1024 } });
+    // OCR engines allocate sizeable WASM/native buffers that are not always
+    // returned to the OS when only a worker thread ends. A dedicated process
+    // gives every import a hard memory boundary and keeps the reader/API alive
+    // during consecutive large-PDF imports.
+    const worker = fork(path.join(__dirname, 'importWorker.js'), [], {
+      execArgv: ['--max-old-space-size=1024'],
+      serialization: 'advanced',
+      stdio: ['ignore', 'inherit', 'inherit', 'ipc'],
+      windowsHide: true,
+    });
     job.worker = worker;
     let settled = false, lastProgressAt = 0;
     const timer = setTimeout(() => finish(Object.assign(new Error('导入处理超时，请检查文件后重试。'), { code: 'IMPORT_TIMEOUT' })), timeoutMs);
@@ -54,7 +63,8 @@ async function createImportJobs({ learningDb, queueTask, commit, maxPending = 4,
           await queueTask(() => update(job.id, 'failed', { error: { code: failure.code || 'DOCUMENT_IMPORT_FAILED', message: failure.message } }));
           job.reject(failure);
         } finally {
-          await worker.terminate();
+          if (worker.connected) worker.disconnect();
+          if (!worker.killed) worker.kill();
           active.delete(job.id);
           job.payload = null;
           pump();
@@ -73,6 +83,7 @@ async function createImportJobs({ learningDb, queueTask, commit, maxPending = 4,
     });
     worker.once('error', finish);
     worker.once('exit', code => { if (!settled) finish(Object.assign(new Error(`解析进程异常退出 (${code})`), { code: 'IMPORT_WORKER_EXIT' })); });
+    worker.send(job.payload);
   }
   async function create(payload, userId) {
     if (pending.length + active.size >= maxPending) throw Object.assign(new Error('导入队列已满，请等待当前文件完成。'), { code: 'IMPORT_QUEUE_FULL', status: 429 });

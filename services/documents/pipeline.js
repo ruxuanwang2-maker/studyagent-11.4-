@@ -11,9 +11,25 @@ const supported = new Set(['pdf', 'docx', 'doc', 'pptx', 'ppt', 'md', 'markdown'
 const LEGACY_OFFICE_TARGETS = { doc: 'docx', ppt: 'pptx', xls: 'xlsx' };
 let officeConverterPromise;
 function extension(name) { return String(name || '').split('.').pop().toLowerCase(); }
-function xmlDecode(value) { return String(value || '').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'"); }
+function xmlDecode(value) { return String(value || '').replace(/&#(x[0-9a-f]+|\d+);|&(amp|lt|gt|quot|apos);/gi, (match, numeric, named) => {
+  if (numeric) { const point = numeric[0].toLowerCase() === 'x' ? parseInt(numeric.slice(1), 16) : Number(numeric); return point > 0 && point <= 0x10ffff ? String.fromCodePoint(point) : match; }
+  return { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'" }[named.toLowerCase()] || match;
+}); }
 function xmlText(fragment) { return xmlDecode(String(fragment || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim()); }
-function xmlTexts(fragment) { return [...String(fragment || '').matchAll(/<a:t[^>]*>([\s\S]*?)<\/a:t>|<w:t[^>]*>([\s\S]*?)<\/w:t>|<t[^>]*>([\s\S]*?)<\/t>/g)].map(match => xmlDecode(match[1] || match[2] || match[3] || '')).join(' ').replace(/\s+/g, ' ').trim(); }
+function xmlTexts(fragment) {
+  const tokens = String(fragment || '').match(/<(?:a|w|m):t\b[^>]*>[\s\S]*?<\/(?:a|w|m):t>|<t\b[^>]*>[\s\S]*?<\/t>|<(?:w:tab|a:tab)\b[^>]*\/?\s*>|<(?:w:br|a:br|w:cr)\b[^>]*\/?\s*>/gi) || [];
+  // OOXML frequently splits a single word or Chinese sentence over formatting runs.
+  // Adding a space at every run boundary corrupts both visible text and retrieval.
+  return tokens.map(token => {
+    if (/^<(?:w:tab|a:tab)\b/i.test(token)) return '\t';
+    if (/^<(?:w:br|a:br|w:cr)\b/i.test(token)) return '\n';
+    return xmlDecode(token.replace(/^<[^>]+>/, '').replace(/<\/[^>]+>$/, ''));
+  }).join('').replace(/[ \t]+\n/g, '\n').trim();
+}
+function officeParagraphText(fragment, tag) {
+  const parts = [...String(fragment || '').matchAll(new RegExp(`<${tag}\\b[^>]*>[\\s\\S]*?<\\/${tag}>`, 'gi'))].map(match => xmlTexts(match[0])).filter(Boolean);
+  return parts.length ? parts.join('\n') : xmlTexts(fragment);
+}
 function fileType(ext) { return ext === 'markdown' ? 'MD' : ext.toUpperCase(); }
 function metadataFor(name, ext) { return { originalName: name, extension: ext, parser: 'structured-document-pipeline', importedAt: new Date().toISOString() }; }
 function section(id, title, content, locator, kind = 'paragraph', position = 0, blocks = []) { return { id, title, content: String(content || '').trim(), locator: locator || {}, kind, position, blocks: Array.isArray(blocks) ? blocks : [] }; }
@@ -43,23 +59,78 @@ function parseCsv(text) {
 }
 
 function ommlToLatex(fragment) {
-  const value = String(fragment || '');
-  const child = (tag, source = value) => source.match(new RegExp(`<m:${tag}[^>]*>([\\s\\S]*?)<\\/m:${tag}>`, 'i'))?.[1] || '';
-  const text = xmlTexts(value);
-  const fraction = value.match(/<m:f[\s\S]*?<m:num>([\s\S]*?)<\/m:num>[\s\S]*?<m:den>([\s\S]*?)<\/m:den>[\s\S]*?<\/m:f>/i);
-  if (fraction) return `\\frac{${ommlToLatex(fraction[1])}}{${ommlToLatex(fraction[2])}}`;
-  const radical = value.match(/<m:rad[\s\S]*?<m:deg>([\s\S]*?)<\/m:deg>[\s\S]*?<m:e>([\s\S]*?)<\/m:e>[\s\S]*?<\/m:rad>/i);
-  if (radical) return `\\sqrt${ommlToLatex(radical[1]) === '2' ? '' : `[${ommlToLatex(radical[1])}]`}{${ommlToLatex(radical[2])}}`;
-  const superscript = value.match(/<m:sSup[\s\S]*?<m:e>([\s\S]*?)<\/m:e>[\s\S]*?<m:sup>([\s\S]*?)<\/m:sup>[\s\S]*?<\/m:sSup>/i);
-  if (superscript) return `${ommlToLatex(superscript[1])}^{${ommlToLatex(superscript[2])}}`;
-  const subscript = value.match(/<m:sSub[\s\S]*?<m:e>([\s\S]*?)<\/m:e>[\s\S]*?<m:sub>([\s\S]*?)<\/m:sub>[\s\S]*?<\/m:sSub>/i);
-  if (subscript) return `${ommlToLatex(subscript[1])}_{${ommlToLatex(subscript[2])}}`;
-  const base = child('e') || value;
-  return xmlTexts(base) || text;
+  const root = { name: 'root', children: [] }; const stack = [root];
+  for (const token of String(fragment || '').match(/<[^>]+>|[^<]+/g) || []) {
+    if (token.startsWith('</')) { if (stack.length > 1) stack.pop(); continue; }
+    if (token.startsWith('<')) {
+      if (/^<\?/.test(token) || /^<!/.test(token)) continue;
+      const name = token.match(/^<([\w:.-]+)/)?.[1]; if (!name) continue;
+      const node = { name: name.split(':').pop(), children: [], attrs: token };
+      stack.at(-1).children.push(node);
+      if (!/\/\s*>$/.test(token)) stack.push(node);
+    } else stack.at(-1).children.push({ name: '#text', text: xmlDecode(token), children: [] });
+  }
+  const child = (node, name) => node.children.find(item => item.name === name);
+  const render = node => {
+    if (!node) return '';
+    if (node.name === '#text') return node.text;
+    const part = name => render(child(node, name));
+    if (node.name === 'f') return `\\frac{${part('num')}}{${part('den')}}`;
+    if (node.name === 'rad') { const degree = part('deg'); return `\\sqrt${degree && degree !== '2' ? `[${degree}]` : ''}{${part('e')}}`; }
+    if (node.name === 'sSup') return `${part('e')}^{${part('sup')}}`;
+    if (node.name === 'sSub') return `${part('e')}_{${part('sub')}}`;
+    if (node.name === 'sSubSup') return `${part('e')}_{${part('sub')}}^{${part('sup')}}`;
+    if (node.name === 'd') return `\\left(${part('e')}\\right)`;
+    if (node.name === 'm') return `\\begin{matrix}${node.children.filter(item => item.name === 'mr').map(render).join('\\\\')}\\end{matrix}`;
+    if (node.name === 'mr') return node.children.filter(item => item.name === 'e').map(render).join(' & ');
+    if (node.name === 't') return node.children.map(render).join('');
+    return node.children.filter(item => !['rPr', 'ctrlPr', 'fPr', 'radPr', 'sSupPr', 'sSubPr', 'sSubSupPr', 'dPr', 'mPr', 'argPr'].includes(item.name)).map(render).join('');
+  };
+  return render(root).trim();
 }
 
 function tableRowsFromDocx(fragment) {
-  return [...String(fragment || '').matchAll(/<w:tr[\s\S]*?<\/w:tr>/g)].map(row => [...row[0].matchAll(/<w:tc[\s\S]*?<\/w:tc>/g)].map(cell => xmlTexts(cell[0])).filter(Boolean)).filter(row => row.length);
+  return [...String(fragment || '').matchAll(/<w:tr\b[\s\S]*?<\/w:tr>/g)].map(row => [...row[0].matchAll(/<w:tc\b[\s\S]*?<\/w:tc>/g)].map(cell => officeParagraphText(cell[0], 'w:p'))).filter(row => row.length);
+}
+
+function paginateDocxSections(name, sourceSections) {
+  const pages = [];
+  let current = [];
+  let characters = 0;
+  const flush = () => {
+    if (!current.length) return;
+    const pageNumber = pages.length + 1;
+    const blocks = current.flatMap(item => item.blocks || []);
+    const heading = blocks.find(block => block.type === 'heading' && block.text)?.text;
+    const content = current.map(item => item.content).filter(Boolean).join('\n');
+    pages.push(section(
+      `${name}-page-${pageNumber}`,
+      heading || `Page ${pageNumber}`,
+      content,
+      {
+        page: pageNumber,
+        paragraphs: current.filter(item => item.kind !== 'table').length,
+        tables: current.filter(item => item.kind === 'table').length,
+        explicitPageBreak: current.some(item => item.locator?.explicitPageBreak)
+      },
+      'page',
+      pageNumber - 1,
+      blocks
+    ));
+    current = [];
+    characters = 0;
+  };
+  for (const item of sourceSections) {
+    const itemLength = String(item.content || '').length;
+    const explicitBreak = Boolean(item.locator?.explicitPageBreak);
+    const headingStartsPage = item.kind === 'heading' && current.length >= 8 && characters >= 1400;
+    const capacityReached = current.length >= 18 || characters + itemLength > 5000;
+    if (current.length && (explicitBreak || headingStartsPage || capacityReached)) flush();
+    current.push(item);
+    characters += itemLength;
+  }
+  flush();
+  return pages;
 }
 
 async function unzip(buffer) {
@@ -69,6 +140,43 @@ async function unzip(buffer) {
 }
 function readFileIfExists(root, relative) { const target = path.join(root, relative); return fs.existsSync(target) ? fs.readFileSync(target, 'utf8') : ''; }
 function sortNumbered(files) { return files.sort((a, b) => (Number(a.match(/(\d+)/)?.[1] || 0) - Number(b.match(/(\d+)/)?.[1] || 0))); }
+
+function imageMime(file) {
+  const ext = extension(file);
+  return ({ png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp', gif: 'image/gif', svg: 'image/svg+xml', emf: 'image/emf', wmf: 'image/wmf' })[ext] || 'application/octet-stream';
+}
+
+async function extractOfficePreviewImage(buffer, format, pageNumber = 1, imageIndex = 0) {
+  const ext = String(format || '').toLowerCase();
+  if (!['docx', 'pptx'].includes(ext)) return null;
+  const archive = await unzip(buffer);
+  try {
+    let target = '';
+    if (ext === 'pptx') {
+      const slide = Math.max(1, Number(pageNumber) || 1);
+      const slideXml = readFileIfExists(archive.tempDir, `ppt/slides/slide${slide}.xml`);
+      const relsXml = readFileIfExists(archive.tempDir, `ppt/slides/_rels/slide${slide}.xml.rels`);
+      const embedIds = [...slideXml.matchAll(/<a:blip\b[^>]*r:embed="([^"]+)"/gi)].map(match => match[1]);
+      const relationships = new Map([...relsXml.matchAll(/<Relationship\b[^>]*>/gi)].map(match => {
+        const id = match[0].match(/\bId="([^"]+)"/i)?.[1];
+        const target = match[0].match(/\bTarget="([^"]+)"/i)?.[1];
+        return [id, xmlDecode(target)];
+      }).filter(([id, value]) => id && value));
+      const mediaTarget = embedIds.map(id => relationships.get(id)).filter(value => value && /\.(png|jpe?g|webp|gif|svg|emf|wmf)$/i.test(value))[Math.max(0, Number(imageIndex) || 0)];
+      if (mediaTarget) target = path.resolve(archive.tempDir, 'ppt', 'slides', mediaTarget);
+    } else {
+      const mediaDir = path.join(archive.tempDir, 'word', 'media');
+      const files = fs.existsSync(mediaDir) ? sortNumbered(fs.readdirSync(mediaDir).filter(file => /\.(png|jpe?g|webp|gif|svg|emf|wmf)$/i.test(file))) : [];
+      if (files.length) target = path.join(mediaDir, files[Math.min(files.length - 1, Math.max(0, Number(pageNumber) - 1 + (Number(imageIndex) || 0)))]);
+    }
+    const resolvedRoot = path.resolve(archive.tempDir);
+    const resolvedTarget = target ? path.resolve(target) : '';
+    if (!resolvedTarget || !resolvedTarget.startsWith(`${resolvedRoot}${path.sep}`) || !fs.existsSync(resolvedTarget)) return null;
+    return { buffer: fs.readFileSync(resolvedTarget), mime: imageMime(resolvedTarget), fileName: path.basename(resolvedTarget) };
+  } finally {
+    archive.cleanup();
+  }
+}
 
 async function parseDocx(name, buffer) {
   const archive = await unzip(buffer); try { const xml = readFileIfExists(archive.tempDir, 'word/document.xml'); const body = xml.match(/<w:body[\s\S]*?<\/w:body>/i)?.[0] || xml; const sections = []; let index = 0; let cursor = 0;
@@ -82,17 +190,66 @@ async function parseDocx(name, buffer) {
         const rows = tableRowsFromDocx(raw); if (!rows.length) continue;
         index += 1; const tableBlocks = [{ type: 'table', headers: rows[0], rows: rows.slice(1), source: 'docx' }]; sections.push(section(`${name}-table-${index}`, `Table ${index}`, rows.map(row => row.join(' | ')).join('\n'), { table: index, rows: rows.length, columns: Math.max(...rows.map(row => row.length)) }, 'table', index, tableBlocks)); continue;
       }
-      const content = xmlTexts(raw); const style = raw.match(/<w:pStyle[^>]*w:val="([^"]+)"/i)?.[1] || ''; const heading = /heading/i.test(style); const listItem = /<w:numPr\b/i.test(raw); const image = /<w:drawing\b|<w:pict\b/i.test(raw); const formulaXml = [...raw.matchAll(/<m:oMath(?:Para)?\b[\s\S]*?<\/m:oMath(?:Para)?>/gi)].map(item => item[0]); const formulaBlocks = formulaXml.map(item => { const latex = ommlToLatex(item); return { type: 'formula', source: xmlTexts(item), latex, confidence: latex ? 0.9 : 0.5, sourceFormat: 'OMML' }; });
-      if (!content && !formulaBlocks.length && !image) continue;
-      index += 1; const blocks = []; if (content) blocks.push({ type: heading ? 'heading' : listItem ? 'list-item' : 'paragraph', text: content, style, list: listItem }); if (image) blocks.push({ type: 'image', alt: content || 'Embedded Word image', source: 'docx' }); blocks.push(...formulaBlocks); const text = [content, ...formulaBlocks.map(item => item.latex)].filter(Boolean).join('\n'); sections.push(section(`${name}-section-${index}`, heading ? content : heading ? content : `${listItem ? 'List item' : 'Paragraph'} ${index}`, text, { paragraph: index, style, list: listItem, image, formula: formulaBlocks.length > 0 }, heading ? 'heading' : formulaBlocks.length ? 'formula' : listItem ? 'list-item' : image ? 'image' : 'paragraph', index, blocks));
+      const formulaMatches = [...raw.matchAll(/<m:oMath\b[\s\S]*?<\/m:oMath>/gi)];
+      const style = raw.match(/<w:pStyle[^>]*w:val="([^"]+)"/i)?.[1] || ''; const heading = /heading/i.test(style); const listItem = /<w:numPr\b/i.test(raw); const image = /<w:drawing\b|<w:pict\b/i.test(raw); const explicitPageBreak = /<w:lastRenderedPageBreak\b|<w:pageBreakBefore\b|<w:br\b[^>]*w:type="page"/i.test(raw);
+      const blocks = []; let offset = 0;
+      for (const formula of formulaMatches) {
+        const before = xmlTexts(raw.slice(offset, formula.index));
+        if (before) blocks.push({ type: heading ? 'heading' : listItem ? 'list-item' : 'paragraph', text: before, style, list: listItem });
+        const latex = ommlToLatex(formula[0]);
+        blocks.push({ type: 'formula', source: xmlTexts(formula[0]), latex, confidence: latex ? 0.9 : 0.5, sourceFormat: 'OMML', provenance: { source: 'omml', verified: true } });
+        offset = formula.index + formula[0].length;
+      }
+      const after = xmlTexts(raw.slice(offset));
+      if (after) blocks.push({ type: heading ? 'heading' : listItem ? 'list-item' : 'paragraph', text: after, style, list: listItem });
+      if (image) blocks.push({ type: 'image', alt: blocks.find(block => block.text)?.text || 'Embedded Word image', source: 'docx' });
+      if (!blocks.length) continue;
+      index += 1;
+      const text = blocks.map(block => block.text || block.latex).filter(Boolean).join('');
+      const content = blocks.filter(block => block.type !== 'image').map(block => block.text || block.latex).filter(Boolean).join('');
+      const formulaCount = formulaMatches.length;
+      sections.push(section(`${name}-section-${index}`, heading ? content : `${listItem ? 'List item' : 'Paragraph'} ${index}`, text, { paragraph: index, style, list: listItem, image, formula: formulaCount > 0, explicitPageBreak }, heading ? 'heading' : formulaCount ? 'formula' : listItem ? 'list-item' : image ? 'image' : 'paragraph', index, blocks));
     }
     const mediaDir = path.join(archive.tempDir, 'word', 'media'); const hasImages = fs.existsSync(mediaDir) && fs.readdirSync(mediaDir).length > 0;
-    return { sections: sections.length ? sections : splitTextSections(name, xmlText(xml)), metadata: { format: 'docx', structured: true, hasTables: /<w:tbl/.test(xml), hasImages, hasFormulas: /<m:oMath/.test(xml), sectionCount: sections.length } };
+    const paginated = sections.length ? paginateDocxSections(name, sections) : splitTextSections(name, xmlText(xml));
+    return { sections: paginated, metadata: { format: 'docx', structured: true, hasTables: /<w:tbl/.test(xml), hasImages, hasFormulas: /<m:oMath/.test(xml), sourceBlockCount: sections.length, pageCount: paginated.length, pagination: 'explicit-breaks-plus-layout-groups' } };
   } finally { archive.cleanup(); }
 }
 
 async function parsePptx(name, buffer) {
-  const archive = await unzip(buffer); try { const slideDir = path.join(archive.tempDir, 'ppt', 'slides'); const files = fs.existsSync(slideDir) ? sortNumbered(fs.readdirSync(slideDir).filter(file => /^slide\d+\.xml$/i.test(file))) : []; const sections = files.map((file, index) => { const xml = fs.readFileSync(path.join(slideDir, file), 'utf8'); const blocks = []; for (const shape of xml.matchAll(/<p:sp\b[\s\S]*?<\/p:sp>/gi)) { const raw = shape[0]; const text = xmlTexts(raw); if (!text) continue; const isTitle = /<p:ph[^>]*type="title"/i.test(raw) || /<p:ph[^>]*type="ctrTitle"/i.test(raw); blocks.push({ type: isTitle ? 'heading' : 'paragraph', text, placeholder: isTitle ? 'title' : 'body' }); } for (const table of xml.matchAll(/<a:tbl\b[\s\S]*?<\/a:tbl>/gi)) { const rows = [...table[0].matchAll(/<a:tr\b[\s\S]*?<\/a:tr>/gi)].map(row => [...row[0].matchAll(/<a:tc\b[\s\S]*?<\/a:tc>/gi)].map(cell => xmlTexts(cell[0]))).filter(row => row.length); if (rows.length) blocks.push({ type: 'table', headers: rows[0], rows: rows.slice(1), source: 'pptx' }); } for (const picture of xml.matchAll(/<p:pic\b[\s\S]*?<\/p:pic>/gi)) blocks.push({ type: 'image', alt: xmlTexts(picture[0]) || `Slide ${index + 1} image`, source: 'pptx' }); const notes = readFileIfExists(archive.tempDir, `ppt/notesSlides/notesSlide${index + 1}.xml`); if (notes) blocks.push({ type: 'note', text: `Notes: ${xmlTexts(notes)}` }); if (!blocks.some(item => item.type === 'heading' || item.type === 'paragraph')) blocks.unshift({ type: 'paragraph', text: xmlTexts(xml) }); const title = blocks.find(item => item.type === 'heading')?.text || `Slide ${index + 1}`; const content = blocks.map(item => item.type === 'table' ? [item.headers, ...item.rows].map(row => row.join(' | ')).join('\n') : item.text || item.alt || '').filter(Boolean).join('\n'); return section(`${name}-slide-${index + 1}`, title, content, { slide: index + 1, source: file, notes: Boolean(notes), shapes: blocks.filter(item => ['heading', 'paragraph'].includes(item.type)).length, tables: blocks.filter(item => item.type === 'table').length, images: blocks.filter(item => item.type === 'image').length }, 'slide', index, blocks); }); return { sections: sections.length ? sections : splitTextSections(name, ''), metadata: { format: 'pptx', structured: true, slideCount: files.length, hasNotes: sections.some(item => item.locator.notes), hasTables: sections.some(item => item.locator.tables > 0), hasImages: sections.some(item => item.locator.images > 0) } }; } finally { archive.cleanup(); }
+  const archive = await unzip(buffer);
+  try {
+    const slideDir = path.join(archive.tempDir, 'ppt', 'slides');
+    const files = fs.existsSync(slideDir) ? sortNumbered(fs.readdirSync(slideDir).filter(file => /^slide\d+\.xml$/i.test(file))) : [];
+    const sections = files.map((file, index) => {
+      const xml = fs.readFileSync(path.join(slideDir, file), 'utf8');
+      const elements = [
+        ...[...xml.matchAll(/<p:sp\b[\s\S]*?<\/p:sp>/gi)].map(match => ({ position: match.index, kind: 'shape', raw: match[0] })),
+        ...[...xml.matchAll(/<a:tbl\b[\s\S]*?<\/a:tbl>/gi)].map(match => ({ position: match.index, kind: 'table', raw: match[0] })),
+        ...[...xml.matchAll(/<p:pic\b[\s\S]*?<\/p:pic>/gi)].map(match => ({ position: match.index, kind: 'image', raw: match[0] }))
+      ].sort((a, b) => a.position - b.position);
+      const blocks = [];
+      for (const element of elements) {
+        if (element.kind === 'shape') {
+          const text = officeParagraphText(element.raw, 'a:p');
+          if (!text) continue;
+          const isTitle = /<p:ph\b[^>]*type="(?:title|ctrTitle)"/i.test(element.raw);
+          blocks.push({ type: isTitle ? 'heading' : 'paragraph', text, placeholder: isTitle ? 'title' : 'body' });
+        } else if (element.kind === 'table') {
+          const rows = [...element.raw.matchAll(/<a:tr\b[\s\S]*?<\/a:tr>/gi)].map(row => [...row[0].matchAll(/<a:tc\b[\s\S]*?<\/a:tc>/gi)].map(cell => xmlTexts(cell[0]))).filter(row => row.length);
+          if (rows.length) blocks.push({ type: 'table', headers: rows[0], rows: rows.slice(1), source: 'pptx' });
+        } else blocks.push({ type: 'image', alt: xmlTexts(element.raw) || `Slide ${index + 1} image`, source: 'pptx' });
+      }
+      const notes = readFileIfExists(archive.tempDir, `ppt/notesSlides/notesSlide${index + 1}.xml`);
+      const notesText = xmlTexts(notes);
+      if (notesText) blocks.push({ type: 'note', text: `Notes: ${notesText}` });
+      if (!blocks.length) blocks.push({ type: 'paragraph', text: xmlTexts(xml) });
+      const title = blocks.find(item => item.type === 'heading')?.text || `Slide ${index + 1}`;
+      const content = blocks.map(item => item.type === 'table' ? [item.headers, ...item.rows].map(row => row.join(' | ')).join('\n') : item.text || item.alt || '').filter(Boolean).join('\n');
+      return section(`${name}-slide-${index + 1}`, title, content, { slide: index + 1, source: file, notes: Boolean(notesText), shapes: blocks.filter(item => ['heading', 'paragraph'].includes(item.type)).length, tables: blocks.filter(item => item.type === 'table').length, images: blocks.filter(item => item.type === 'image').length }, 'slide', index, blocks);
+    });
+    return { sections: sections.length ? sections : splitTextSections(name, ''), metadata: { format: 'pptx', structured: true, slideCount: files.length, hasNotes: sections.some(item => item.locator.notes), hasTables: sections.some(item => item.locator.tables > 0), hasImages: sections.some(item => item.locator.images > 0) } };
+  } finally { archive.cleanup(); }
 }
 
 async function parseXlsx(name, buffer) {
@@ -152,7 +309,16 @@ async function parseStructuredDocument({ name, buffer, parsePdf, ocrImage, visio
     let converted = null; let conversionError = null;
     try { converted = await convertLegacyOffice(name, buffer, ext); } catch (error) { conversionError = error; }
     if (converted) parsed = converted;
-    else { const sections = legacyOfficeSections(name, buffer); parsed = { sections, metadata: { format: type, structured: false, warning: 'legacy-binary-parser-limited', textExtraction: sections.some(item => !item.content.startsWith('此旧版 Office 文件已保存')) ? 'printable-run-fallback' : 'none', conversion: 'unavailable-or-failed', conversionError: conversionError?.message || null } }; }
+    else {
+      // A binary OLE Office file is not text. Indexing incidental printable bytes
+      // would make the document look imported while silently corrupting study data.
+      if (buffer.subarray(0, 8).equals(Buffer.from('d0cf11e0a1b11ae1', 'hex'))) {
+        const error = new Error(`旧版 ${type} 需要安装 LibreOffice 转换器，或先在 WPS/Office 中另存为 ${LEGACY_OFFICE_TARGETS[ext].toUpperCase()} 再导入。`);
+        error.code = 'OFFICE_CONVERTER_REQUIRED'; error.cause = conversionError; throw error;
+      }
+      const sections = legacyOfficeSections(name, buffer);
+      parsed = { sections, metadata: { format: type, structured: false, warning: 'legacy-binary-parser-limited', textExtraction: 'printable-run-fallback', conversion: 'unavailable-or-failed', conversionError: conversionError?.message || null } };
+    }
   }
   else parsed = { sections: splitTextSections(name, buffer.toString('utf8')), metadata: { format: type, structured: true } };
   const sections = parsed.sections.filter(item => item.content || item.kind === 'image').map((item, index) => ({ ...item, locator: { ...(item.locator || {}), page: Number(item.locator?.page || item.locator?.slide || item.locator?.sheet || index + 1) } })); const chunks = []; for (const item of sections) { const paragraphs = item.content.split(/\n{2,}|(?<=[。！？.!?])\s+/).map(value => value.trim()).filter(Boolean); let current = ''; let index = 0; for (const paragraph of paragraphs.length ? paragraphs : ['']) { if (current && current.length + paragraph.length + 1 > 900) { chunks.push({ id: `${item.id}-chunk-${index++}`, sectionId: item.id, content: current, chunkIndex: index, metadata: { ...item.locator, title: item.title, kind: item.kind } }); current = ''; } current += `${current ? '\n' : ''}${paragraph}`; } if (current) chunks.push({ id: `${item.id}-chunk-${index++}`, sectionId: item.id, content: current, chunkIndex: index, metadata: { ...item.locator, title: item.title, kind: item.kind } }); }
@@ -160,4 +326,4 @@ async function parseStructuredDocument({ name, buffer, parsePdf, ocrImage, visio
   return { fileType: type, sections, chunks, metadata: { ...metadataFor(name, ext), ...parsed.metadata } };
 }
 
-module.exports = { supported, extension, parseStructuredDocument, legacyOfficeStatus };
+module.exports = { supported, extension, parseStructuredDocument, legacyOfficeStatus, paginateDocxSections, extractOfficePreviewImage };

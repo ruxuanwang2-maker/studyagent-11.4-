@@ -55,6 +55,15 @@ for (const entry of fs.readdirSync(lectureRoot, { recursive: true, withFileTypes
 }
 files.sort((left, right) => left.localeCompare(right, 'zh-CN'));
 if (!files.length) fail(`no supported learning files found under ${lectureRoot}`);
+// The largest lecture is intentionally excluded from routine regression. It
+// remains a valid user document, but repeatedly OCR-processing it makes the
+// fast regression disproportionately slow and was explicitly excluded by the
+// project owner. Set STUDYAGENT_INCLUDE_LARGEST_LECTURE=1 for a stress run.
+if (files.length > 1 && process.env.STUDYAGENT_INCLUDE_LARGEST_LECTURE !== '1') {
+  const largest = files.reduce((current, file) => fs.statSync(file).size > fs.statSync(current).size ? file : current, files[0]);
+  files.splice(files.indexOf(largest), 1);
+  console.log(`lecture regression: excluded largest file ${displayName(largest)} (${Math.ceil(fs.statSync(largest).size / 1024 / 1024)} MB)`);
+}
 
 const created = [];
 const results = [];

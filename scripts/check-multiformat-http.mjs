@@ -24,7 +24,7 @@ function archiveFixture(name, files) {
   for (const [relative, content] of Object.entries(files)) {
     const target = path.join(source, relative);
     fs.mkdirSync(path.dirname(target), { recursive: true });
-    fs.writeFileSync(target, content, 'utf8');
+    fs.writeFileSync(target, content, Buffer.isBuffer(content) ? undefined : 'utf8');
   }
   execFileSync(process.platform === 'win32' ? 'tar.exe' : 'tar', ['-a', '-c', '-f', archive, '-C', source, '.'], { stdio: 'ignore' });
   return fs.readFileSync(archive);
@@ -40,12 +40,15 @@ const fixtures = [
     buffer: archiveFixture('docx', {
       'word/document.xml': '<w:document><w:body><w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>HTTP DOCX heading</w:t></w:r></w:p><w:p><w:r><w:t>Structured paragraph.</w:t></w:r></w:p><w:tbl><w:tr><w:tc><w:p><w:r><w:t>Header</w:t></w:r></w:p></w:tc></w:tr></w:tbl></w:body></w:document>'
     }),
-    check: (catalogued) => catalogued.content.some(item => item.type === 'heading') && catalogued.content.some(item => item.type === 'table')
+    check: (catalogued) => catalogued.content.length === 1 && catalogued.content.some(item => item.type === 'page' && item.blocks?.some(block => block.type === 'heading') && item.blocks?.some(block => block.type === 'table'))
   },
   {
     name: `http-${suffix}.pptx`,
     buffer: archiveFixture('pptx', {
-      'ppt/slides/slide1.xml': '<p:sld><p:cSld><p:sp><p:nvSpPr><p:ph type="title"/></p:nvSpPr><a:t>HTTP Slide</a:t></p:sp><p:sp><a:t>Slide body</a:t></p:sp><a:tbl><a:tr><a:tc><a:t>Header</a:t></a:tc></a:tr></a:tbl></p:cSld></p:sld>',
+      'ppt/slides/slide1.xml': '<p:sld><p:cSld><p:sp><p:nvSpPr><p:ph type="title"/></p:nvSpPr><a:t>HTTP Slide</a:t></p:sp><p:sp><a:t>Slide body</a:t></p:sp><p:pic><p:blipFill><a:blip r:embed="rId2"/></p:blipFill></p:pic><a:tbl><a:tr><a:tc><a:t>Header</a:t></a:tc></a:tr></a:tbl><p:pic><p:blipFill><a:blip r:embed="rId3"/></p:blipFill></p:pic></p:cSld></p:sld>',
+      'ppt/slides/_rels/slide1.xml.rels': '<Relationships><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image1.png"/><Relationship Target="../media/image2.png" Id="rId3"/></Relationships>',
+      'ppt/media/image1.png': Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64'),
+      'ppt/media/image2.png': Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64'),
       'ppt/notesSlides/notesSlide1.xml': '<p:notes><a:t>HTTP notes</a:t></p:notes>'
     }),
     check: (catalogued) => catalogued.content.some(item => item.locator?.slide === 1 && item.blocks?.some(block => block.type === 'note' || block.type === 'table'))
@@ -82,6 +85,13 @@ try {
     if (fixture.name.endsWith('.png')) {
       const original = await fetch(`${base}/api/documents/${encodeURIComponent(imported.id)}/file`);
       if (!original.ok || original.headers.get('content-type') !== 'image/png' || (await original.arrayBuffer()).byteLength < 20) throw new Error(`${fixture.name} original image endpoint is unavailable`);
+    }
+    if (fixture.name.endsWith('.pptx')) {
+      const preview = await fetch(`${base}/api/documents/${encodeURIComponent(imported.id)}/office-preview/1`);
+      const previewBytes = Buffer.from(await preview.arrayBuffer());
+      if (!preview.ok || preview.headers.get('content-type') !== 'image/png' || previewBytes.byteLength < 20) throw new Error(`${fixture.name} embedded slide preview endpoint is unavailable (${preview.status} ${preview.headers.get('content-type') || 'no content type'}: ${previewBytes.toString('utf8').slice(0, 300)})`);
+      const second = await fetch(`${base}/api/documents/${encodeURIComponent(imported.id)}/office-preview/1?image=1`);
+      if (!second.ok || second.headers.get('content-type') !== 'image/png' || (await second.arrayBuffer()).byteLength < 20) throw new Error(`${fixture.name} second slide image is unavailable`);
     }
   }
   const batch = await request('/api/documents/upload-batch', {
