@@ -23,8 +23,10 @@ await new Promise(resolve => mock.listen(0, '127.0.0.1', resolve));
 const port = mock.address().port;
 let configId = null;
 let documentId = null;
+let cookie = '';
 async function request(path, options = {}) {
-  const response = await fetch(`${base}${path}`, { headers: { 'Content-Type': 'application/json', ...(options.headers || {}) }, ...options });
+  const response = await fetch(`${base}${path}`, { headers: { 'Content-Type': 'application/json', ...(cookie ? { Cookie: cookie } : {}), ...(options.headers || {}) }, ...options });
+  cookie = (response.headers.get('set-cookie') || '').split(';')[0] || cookie;
   const data = await response.json();
   assert.equal(response.ok, true, `${options.method || 'GET'} ${path} failed: ${JSON.stringify(data)}`);
   return data;

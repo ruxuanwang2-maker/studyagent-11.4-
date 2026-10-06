@@ -4,15 +4,18 @@ import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const base = process.env.STUDYAGENT_URL || 'http://127.0.0.1:4173';
+let cookie = '';
 
 async function request(path, options = {}) {
-  const response = await fetch(`${base}${path}`, { headers: { 'Content-Type': 'application/json' }, ...options });
+  const response = await fetch(`${base}${path}`, { ...options, headers: { 'Content-Type': 'application/json', ...(cookie ? { Cookie: cookie } : {}), ...(options.headers || {}) } });
+  cookie = (response.headers.get('set-cookie') || '').split(';')[0] || cookie;
   const text = await response.text();
   let data;
   try { data = text ? JSON.parse(text) : {}; } catch { data = { raw: text }; }
   if (!response.ok) throw new Error(`${options.method || 'GET'} ${path} -> ${response.status}: ${data?.error?.message || text}`);
   return data;
 }
+function sessionFetch(path, options = {}) { return fetch(`${base}${path}`, { ...options, headers: { ...(cookie ? { Cookie: cookie } : {}), ...(options.headers || {}) } }); }
 
 const suffix = Date.now().toString(36);
 const fixtureRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'tmp', 'multiformat-http-fixtures');
@@ -83,14 +86,14 @@ try {
     if (fixture.kind === 'heading' && !catalogued.content.some(item => item.type === 'heading' || item.locator?.heading)) throw new Error(`${fixture.name} lost heading structure`);
     if (fixture.check && !fixture.check(catalogued)) throw new Error(`${fixture.name} lost native structure in HTTP upload`);
     if (fixture.name.endsWith('.png')) {
-      const original = await fetch(`${base}/api/documents/${encodeURIComponent(imported.id)}/file`);
+      const original = await sessionFetch(`/api/documents/${encodeURIComponent(imported.id)}/file`);
       if (!original.ok || original.headers.get('content-type') !== 'image/png' || (await original.arrayBuffer()).byteLength < 20) throw new Error(`${fixture.name} original image endpoint is unavailable`);
     }
     if (fixture.name.endsWith('.pptx')) {
-      const preview = await fetch(`${base}/api/documents/${encodeURIComponent(imported.id)}/office-preview/1`);
+      const preview = await sessionFetch(`/api/documents/${encodeURIComponent(imported.id)}/office-preview/1`);
       const previewBytes = Buffer.from(await preview.arrayBuffer());
       if (!preview.ok || preview.headers.get('content-type') !== 'image/png' || previewBytes.byteLength < 20) throw new Error(`${fixture.name} embedded slide preview endpoint is unavailable (${preview.status} ${preview.headers.get('content-type') || 'no content type'}: ${previewBytes.toString('utf8').slice(0, 300)})`);
-      const second = await fetch(`${base}/api/documents/${encodeURIComponent(imported.id)}/office-preview/1?image=1`);
+      const second = await sessionFetch(`/api/documents/${encodeURIComponent(imported.id)}/office-preview/1?image=1`);
       if (!second.ok || second.headers.get('content-type') !== 'image/png' || (await second.arrayBuffer()).byteLength < 20) throw new Error(`${fixture.name} second slide image is unavailable`);
     }
   }

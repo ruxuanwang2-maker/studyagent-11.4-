@@ -63,7 +63,7 @@ if (!parsedVisionImage.metadata.vision || !parsedVisionImage.sections[0]?.blocks
 const testUserId = `learning-core-${process.pid}-${Date.now()}`;
 let db;
 try {
-  db = await createLearningDb();
+  db = await createLearningDb(path.join(fixtureRoot, 'core.sqlite'));
   await db.createUserAccount({ id: testUserId, email: `${testUserId}@example.test`, username: 'Core test' });
   db.setUserId(testUserId);
   const testWorkspace = await db.createWorkspace('Core test workspace');

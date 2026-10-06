@@ -26,7 +26,7 @@ const checks = [
 ];
 
 async function isReady() {
-  try { return (await fetch(`${base}/api/auth/session`, { signal: AbortSignal.timeout(3000) })).ok; } catch { return false; }
+  try { return (await fetch(`${base}/api/health`, { signal: AbortSignal.timeout(3000) })).ok; } catch { return false; }
 }
 
 function run(label, script) {
