@@ -2,9 +2,9 @@
 
 ## 已执行的机制
 
-数据库后端现为 MySQL，连接由环境变量配置，`schema_migrations` 记录已完成的结构版本。迁移 SQL 使用 MySQL 语法并尽可能保持可重入。MySQL 的 DDL 会隐式提交，因此迁移不能承诺通过事务回滚恢复结构。
+数据库默认使用 SQLite，设置 `STUDYAGENT_DB=mysql` 后切换到 MySQL。两个后端分别维护兼容的结构迁移入口，`schema_migrations` 记录已完成版本。SQLite 迁移前会保留版本备份；MySQL 迁移使用 MySQL 语法并尽可能保持可重入。MySQL 的 DDL 会隐式提交，因此不能承诺通过事务回滚恢复结构。
 
-升级或迁移前应使用 `mysqldump` 等 MySQL 工具备份数据库。原先的 `data/studyagent.sqlite` 文件不会由连接层自动导入 MySQL；需保留该文件作为迁移前副本，并在需要保留其中数据时单独执行数据迁移。
+SQLite 本地升级应保留 `data/studyagent.sqlite` 及程序生成的版本备份；MySQL 升级前应使用 `mysqldump` 等工具备份数据库。`data/studyagent.sqlite` 不会由连接层自动导入 MySQL，反向也不会自动同步；跨后端迁移必须使用单独的数据迁移流程。
 
 v1 新建 chapters/learning_events，并从明确 heading 结构回填章节。历史事件不会凭空回填成“用户学习过”；旧概念/笔记/问答保留。
 
