@@ -6,7 +6,7 @@
 
 - 前端：原生 HTML / CSS / JavaScript，静态资源由同一 Node 服务提供；PDF.js 4.10 本地资源；公式主要通过自实现 LaTeX → MathML 渲染。
 - 后端：Node.js 22.5+，CommonJS，原生 HTTP 路由，无 Express、TypeScript、ORM、前端构建步骤。
-- 数据库：通过 `mysql2/promise` 连接 MySQL 连接池；连接由 `MYSQL_HOST`、`MYSQL_PORT`、`MYSQL_USER`、`MYSQL_PASSWORD`、`MYSQL_DATABASE` 配置。原始文件在 `uploads/`，解析资料、学习对象主要在 MySQL。
+- 数据库：默认使用 Node 内置 SQLite，零配置保存在 `data/studyagent.sqlite`；设置 `STUDYAGENT_DB=mysql` 后通过 `mysql2/promise` 连接 MySQL。原始文件保存在 `uploads/`，解析资料与学习对象进入当前数据库适配器。
 - 历史兼容层：`data/studyagent.json` 仍保存部分资料视图、访客设置和历史状态。双存储不是新设计目标，暂不直接删除。
 - AI：服务端 Provider 工厂适配 OpenAI-compatible、Anthropic、Gemini、Mathpix；Ollama 使用兼容接口。
 - OCR：Tesseract.js 中文/英文、Poppler 页面图片、可配置 Mathpix。数学规则校正不是通用数学 OCR 模型。
@@ -19,7 +19,7 @@
 public/                    页面、交互、PDF 阅读、样式
 server.js                  HTTP API、导入协调、学习业务、服务启动
 config/modelProviders.js   Provider 预设及模型列表
-services/db/               MySQL 连接池、兼容迁移、版本化迁移
+services/db/               SQLite/MySQL 适配器、兼容迁移、版本化迁移
 services/documents/        多格式结构解析
 services/rag/              词法 + 本地哈希向量检索、Embedding 索引
 services/memory/           概念规则、历史问题关联、复习记录
@@ -61,13 +61,13 @@ data/ uploads/ tmp/        运行数据；不要上传 GitHub
 
 ## 6. 文档完整调用链
 
-上传 JSON（含 base64）→ 扩展名/大小检查 → 保存原始文件 → PDF 原生文本/OCR 或 Office/文本/表格解析 → Sections/Blocks/Locator → Chunks → MySQL → 本地索引 → 列表/阅读/检索。
+上传 JSON（含 base64）→ 扩展名/大小检查 → 保存原始文件 → PDF 原生文本/OCR 或 Office/文本/表格解析 → Sections/Blocks/Locator → Chunks → 当前数据库 → 本地索引 → 列表/阅读/检索。
 
 PDF 由后端协调 PDF.js、Poppler、OCR；Word/PPT 的原生排版并没有完整重建，解析层主要保留语义结构。旧 DOC/PPT/XLS 在没有 LibreOffice 时仅有限可读字符串提取。图片描述必须配置支持 Vision 的 Provider。
 
 ## 7. RAG
 
-MySQL 存片段和向量；检索先限定当前用户与文档/课程，再按关键词和 96 维本地哈希向量加权排序。没有 BM25、训练式 reranker 或 ANN 索引。远程 Embedding 可建索引，但回答检索仍走明确标记的本地检索，不声称已经支持远程查询向量。见 RAG_ARCHITECTURE.md。
+SQLite 或 MySQL 存片段和向量；检索先限定当前用户与文档/课程，再按关键词和 96 维本地哈希向量加权排序。没有 BM25、训练式 reranker 或 ANN 索引。远程 Embedding 可建索引，但回答检索仍走明确标记的本地检索，不声称已经支持远程查询向量。见 RAG_ARCHITECTURE.md。
 
 ## 8. 用户数据存储
 

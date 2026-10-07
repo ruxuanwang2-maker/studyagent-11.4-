@@ -1,6 +1,6 @@
 # 数据库 Schema
 
-主库：MySQL `studyagent` 数据库；连接参数通过 `MYSQL_HOST`、`MYSQL_PORT`、`MYSQL_USER`、`MYSQL_PASSWORD`、`MYSQL_DATABASE` 环境变量配置。下面是职责映射，完整 DDL 以 services/db/sqlite.js 与 migrations.js 为准。
+默认主库为本地 `data/studyagent.sqlite`；设置 `STUDYAGENT_DB=mysql` 后使用 MySQL `studyagent`。MySQL 连接参数通过 `MYSQL_HOST`、`MYSQL_PORT`、`MYSQL_USER`、`MYSQL_PASSWORD`、`MYSQL_DATABASE` 配置。两个后端由同一数据库接口封装，完整定义以 `services/db/sqlite.js`、`services/db/mysql.js` 与对应 migrations 为准。
 
 | 表组 | 表 | 职责/隔离 |
 |---|---|---|
@@ -41,6 +41,6 @@ schema_migrations：version PK、name、applied_at（DATETIME）。
 
 ## 写入与删除
 
-数据库访问使用异步连接池；需要原子性的文档修改和向量写入通过 MySQL 事务执行。MySQL DDL 会隐式提交，版本迁移不能依赖事务回滚；部署前应使用 MySQL 备份工具备份数据库。章节随对应文档/Section 删除。删除批注/普通笔记同步清理源事件；账号删除/课程记忆清空/文档删除覆盖新增事件。导出包含事件和章节。
+SQLite 使用本地事务，MySQL 使用异步连接池与事务；需要原子性的文档修改和向量写入均通过适配器事务执行。MySQL DDL 会隐式提交，版本迁移不能依赖事务回滚；部署前应使用 MySQL 备份工具备份数据库。章节随对应文档/Section 删除。删除批注/普通笔记同步清理源事件；账号删除/课程记忆清空/文档删除覆盖新增事件。导出包含事件和章节。
 
 大部分历史表仍无数据库 FK，某些旧清理流程还不是事务；应用层授权不能替代完整约束测试。数据库文件包含隐私，不可提交 GitHub。

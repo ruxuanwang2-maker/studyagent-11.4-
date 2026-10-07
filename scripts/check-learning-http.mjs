@@ -74,7 +74,7 @@ if (!(await request(`/api/notes/${encodeURIComponent(createdNote.id)}`, { method
 if (!(await request(`/api/cards/${encodeURIComponent(createdCard.id)}`, { method: 'DELETE' })).ok) throw new Error('HTTP card delete regression');
 
 const analytics = await request('/api/analytics');
-if (analytics.source !== 'mysql-learning-events' || !Array.isArray(analytics.dailyActivity) || typeof analytics.documents !== 'number') throw new Error('HTTP analytics regression');
+if (!/^(sqlite|mysql)-learning-events$/.test(analytics.source) || !Array.isArray(analytics.dailyActivity) || typeof analytics.documents !== 'number') throw new Error('HTTP analytics regression');
 const search = await request('/api/learning/search?q=backward%20error&scope=workspace&limit=3');
 if (search.scope !== 'workspace' || !Array.isArray(search.results)) throw new Error('HTTP workspace retrieval regression');
 const encodedDocumentId = encodeURIComponent(document.id);
@@ -130,4 +130,4 @@ for (const input of planCases) {
   if (input.scope === 'course' && plan.retrieved.some(item => item.courseId !== document.courseId)) throw new Error('HTTP agent course scope leaked outside the course');
   agentPlans[input.scope] = plan.retrieved.length;
 }
-console.log(JSON.stringify({ ok: true, documentId: document.id, note: 'create/update/list/delete', annotation: 'create/list/delete', card: 'create/list/delete', graphRelation: 'create/list/delete', documentOrganization: 'import/move/unassign/delete', formulaContext: 'latex', quizTypes, catalog: 'mysql', knowledge: 'points/graph', review: 'mysql', analyticsSource: analytics.source, retrievalScopes: { workspace: search.results.length, currentPage: currentPageSearch.results.length, currentDocument: currentDocumentSearch.results.length, documents: selectedDocumentsSearch.results.length, course: courseSearch.results.length }, agentPlans }));
+console.log(JSON.stringify({ ok: true, documentId: document.id, note: 'create/update/list/delete', annotation: 'create/list/delete', card: 'create/list/delete', graphRelation: 'create/list/delete', documentOrganization: 'import/move/unassign/delete', formulaContext: 'latex', quizTypes, catalog: analytics.source.split('-')[0], knowledge: 'points/graph', review: 'database', analyticsSource: analytics.source, retrievalScopes: { workspace: search.results.length, currentPage: currentPageSearch.results.length, currentDocument: currentDocumentSearch.results.length, documents: selectedDocumentsSearch.results.length, course: courseSearch.results.length }, agentPlans }));

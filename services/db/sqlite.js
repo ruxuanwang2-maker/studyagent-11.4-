@@ -237,7 +237,7 @@ function createLearningDb(file) {
         const sectionId = `${documentId}-section-${page.page || index + 1}`;
         stmt('INSERT OR IGNORE INTO document_sections(id,document_id,title,content,locator_json,position,kind) VALUES(?,?,?,?,?,?,?)').run(sectionId, documentId, page.heading || `Page ${page.page || index + 1}`, page.text || '', json({ page: page.page || index + 1, source: page.source || 'legacy' }), index, page.type === 'formula' ? 'formula' : 'page');
         const chunkId = `${sectionId}-chunk-1`;
-        stmt('INSERT OR IGNORE INTO document_chunks(id,document_id,section_id,content,chunk_index,metadata_json) VALUES(?,?,?,?,?,?)').run(chunkId, legacyDoc.id, sectionId, page.text || '', 0, json({ page: page.page || index + 1, heading: page.heading || '' }));
+        stmt('INSERT OR IGNORE INTO document_chunks(id,document_id,section_id,content,chunk_index,metadata_json) VALUES(?,?,?,?,?,?)').run(chunkId, documentId, sectionId, page.text || '', 0, json({ page: page.page || index + 1, heading: page.heading || '' }));
       }
     }
     for (const legacyMemory of legacy?.knowledge || []) {
