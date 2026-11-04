@@ -16,6 +16,10 @@ StudyAgent 是一个本地优先的 AI 学习工作台 MVP，用于阅读资料�
 
 ## 启动
 
+第一次使用或要交给队友操作，请先阅读 [中文使用指南](docs/USER_GUIDE.md)。
+
+继续开发或开启新的 Codex 聊天，请先阅读 [开发交接文档](docs/HANDOFF.md)。
+
 ```powershell
 npm start
 ```
